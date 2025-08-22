@@ -1,0 +1,8 @@
+python-telegram-bot==22.3
+scrapy==2.13.3  # (assumed future latest; confirm via PyPI)
+selenium==4.35.0  # Latest stable as of August 12, 2025
+pandas==2.3.2
+pydantic==2.11.1
+apscheduler==3.11.0
+webdriver-manager==4.0.2
+requests==2.32.3
