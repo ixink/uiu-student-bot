@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: uiu-developer-hub-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    region: oregon
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+    healthCheckPath: /
+    autoDeploy: false
