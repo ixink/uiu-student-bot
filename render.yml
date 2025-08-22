@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: uiu-developer-hub-bot
+    name: uiu-student-bot
     env: docker
     dockerfilePath: ./Dockerfile
     region: oregon
