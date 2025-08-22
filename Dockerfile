@@ -12,11 +12,14 @@ RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     unzip \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Chrome
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list \
+# Install Google Chrome
+RUN wget -q -O /tmp/google-chrome-key.asc https://dl-ssl.google.com/linux/linux_signing_key.pub \
+    && mkdir -p /etc/apt/keyrings \
+    && mv /tmp/google-chrome-key.asc /etc/apt/keyrings/google-chrome.asc \
+    && echo "deb [signed-by=/etc/apt/keyrings/google-chrome.asc] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
     && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
