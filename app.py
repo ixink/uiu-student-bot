@@ -19,7 +19,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel, ValidationError
 from aiohttp import web
 from typing import List, Dict
-from requests.exceptions import HTTPError, ConnectionError, Timeout
+from telegram.error import TelegramError
 
 # Configure logging
 logging.config.fileConfig('logging.conf')
@@ -102,7 +102,7 @@ MOCK_STACKOVERFLOW = [
     {"title": "How to debug Python code", "tags": "python, debugging", "link": "https://stackoverflow.com/questions/12345"}
 ]
 
-# Scrapy Spiders (unchanged from previous)
+# Scrapy Spiders (unchanged)
 class RoadmapSpider(scrapy.Spider):
     name = "roadmap"
     def __init__(self, roadmap_type="python", *args, **kwargs):
@@ -377,67 +377,86 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Use /help for a list of commands and usage instructions.",
             reply_markup=reply_markup
         )
+    except TelegramError as e:
+        logger.error(f"Telegram error in start command: {e}")
+        await update.message.reply_text("Failed to start the bot due to a Telegram API issue. Please try again.")
     except Exception as e:
         logger.error(f"Error in start command: {e}")
-        await update.message.reply_text("Error starting the bot. Please try again or use /help for details.")
+        await update.message.reply_text("Error starting the bot. Please try again or contact support.")
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        help_text = (
-            "📚 *UIU Developer Hub Bot Commands*\n\n"
-            "1. **/start** - Start the bot and see welcome message.\n"
-            "2. **/help** - Show this help message with all commands.\n"
-            "3. **/calendar** - View UIU academic calendar events.\n"
-            "4. **/resources [keyword]** - Find open-source learning resources.\n"
-            "   Example: /resources python\n"
-            "5. **/trending [language]** - View GitHub trending repositories.\n"
-            "   Example: /trending javascript\n"
-            "6. **/stackoverflow [tag]** - View recent Stack Overflow questions.\n"
-            "   Example: /stackoverflow python\n"
-            "7. **/jobs [keyword]** - Find job and internship opportunities.\n"
-            "   Example: /jobs internship\n"
-            "8. **/roadmap <type> [level]** - Get a learning roadmap from roadmap.sh.\n"
-            "   Example: /roadmap python beginner\n"
-            "9. **/mentor find <department|expertise>** - Find UIU faculty mentors from all departments (CSE, EEE, Civil Engineering, Business Administration, Economics, Pharmacy, INS, English, EDS, MSJ, BGE).\n"
-            "   Example: /mentor find CSE\n"
-            "10. **/notice** - View latest UIU notices.\n"
-            "11. **/collab post <message>** - Post a collaboration request.\n"
-            "    Example: /collab post Looking for hackathon teammates\n"
-            "12. **/events** - View upcoming UIU events.\n"
-            "13. **/links** - Get university service links (UCAM, Library, etc.).\n"
-            "14. **/leaderboard** - View developer recognition leaderboard (coming soon).\n"
-            "15. **/meetup** - View tech meetups and coding jams (coming soon).\n"
-            "16. **/internship** - Find internships (use /jobs).\n"
-            "17. **/cgpa <course:grade>** - Calculate CGPA.\n"
-            "    Example: /cgpa cse321:A cse322:B+\n"
-            "18. **/gpapredict <current_cgpa> <target_cgpa>** - Predict grades needed.\n"
-            "    Example: /gpapredict 3.5 3.8\n"
-            "19. **/scholarships** - View scholarship opportunities.\n"
-            "20. **/academic** - View academic calendar (same as /calendar).\n"
-            "21. **/career** - Career office updates (coming soon).\n"
-            "22. **/fyp <ideas|docs>** - Get FYP ideas or documentation (coming soon).\n"
-            "    Example: /fyp ideas\n"
-            "23. **/studyplan <courses> <hours> <date> <priority>** - Create a study plan.\n"
-            "    Example: /studyplan cse321,cse322 10 2025-12-01 cse321:1,cse322:2\n"
-            "24. **/reminders add <task> <date> [recurrence]** - Set reminders.\n"
-            "    Example: /reminders add Meet Dr. Suman 2025-09-01 weekly\n"
-            "25. **/reminders list** - List all reminders.\n"
-            "26. **/motivate** - Get motivational tips.\n"
-            "27. **/codeshare add <description> <tags> <code>** - Share code snippets.\n"
-            "    Example: /codeshare add BubbleSort python def bubble_sort(arr):...\n"
-            "28. **/codeshare list [tag]** - List your code snippets.\n"
-            "    Example: /codeshare list python\n"
-            "29. **/profile set <department> <year> <roadmaps>** - Set user profile.\n"
-            "    Example: /profile set CSE 2 python,javascript\n"
-            "30. **/progress [type]** - Track roadmap or study plan progress.\n"
-            "    Example: /progress python\n"
-            "31. **/recommend** - Get personalized resources, jobs, and mentors.\n"
-            "\n*Note*: Some features (e.g., /leaderboard, /career) are coming soon due to data access limitations. Use inline buttons for quick actions."
-        )
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        # Split help_text into chunks to avoid Telegram message length limit
+        help_text_chunks = [
+            (
+                "📚 *UIU Developer Hub Bot Commands* (Part 1/2)\n\n"
+                "1. **/start** - Start the bot and see welcome message.\n"
+                "2. **/help** - Show this help message with all commands.\n"
+                "3. **/calendar** - View UIU academic calendar events.\n"
+                "4. **/resources [keyword]** - Find open-source learning resources.\n"
+                "   Example: /resources python\n"
+                "5. **/trending [language]** - View GitHub trending repositories.\n"
+                "   Example: /trending javascript\n"
+                "6. **/stackoverflow [tag]** - View recent Stack Overflow questions.\n"
+                "   Example: /stackoverflow python\n"
+                "7. **/jobs [keyword]** - Find job and internship opportunities.\n"
+                "   Example: /jobs internship\n"
+                "8. **/roadmap <type> [level]** - Get a learning roadmap from roadmap.sh.\n"
+                "   Example: /roadmap python beginner\n"
+                "9. **/mentor find <department|expertise>** - Find UIU faculty mentors.\n"
+                "   Example: /mentor find CSE\n"
+                "10. **/notice** - View latest UIU notices.\n"
+                "11. **/collab post <message>** - Post a collaboration request.\n"
+                "    Example: /collab post Looking for hackathon teammates\n"
+                "12. **/events** - View upcoming UIU events.\n"
+                "13. **/links** - Get university service links (UCAM, Library, etc.).\n"
+                "14. **/leaderboard** - View developer recognition leaderboard (coming soon).\n"
+                "15. **/meetup** - View tech meetups and coding jams (coming soon).\n"
+            ),
+            (
+                "📚 *UIU Developer Hub Bot Commands* (Part 2/2)\n\n"
+                "16. **/internship** - Find internships (use /jobs).\n"
+                "17. **/cgpa <course:grade>** - Calculate CGPA.\n"
+                "    Example: /cgpa cse321:A cse322:B+\n"
+                "18. **/gpapredict <current_cgpa> <target_cgpa>** - Predict grades needed.\n"
+                "    Example: /gpapredict 3.5 3.8\n"
+                "19. **/scholarships** - View scholarship opportunities.\n"
+                "20. **/academic** - View academic calendar (same as /calendar).\n"
+                "21. **/career** - Career office updates (coming soon).\n"
+                "22. **/fyp <ideas|docs>** - Get FYP ideas or documentation (coming soon).\n"
+                "    Example: /fyp ideas\n"
+                "23. **/studyplan <courses> <hours> <date> <priority>** - Create a study plan.\n"
+                "    Example: /studyplan cse321,cse322 10 2025-12-01 cse321:1,cse322:2\n"
+                "24. **/reminders add <task> <date> [recurrence]** - Set reminders.\n"
+                "    Example: /reminders add Meet Dr. Suman 2025-09-01 weekly\n"
+                "25. **/reminders list** - List all reminders.\n"
+                "26. **/motivate** - Get motivational tips.\n"
+                "27. **/codeshare add <description> <tags> <code>** - Share code snippets.\n"
+                "    Example: /codeshare add BubbleSort python def bubble_sort(arr):...\n"
+                "28. **/codeshare list [tag]** - List your code snippets.\n"
+                "    Example: /codeshare list python\n"
+                "29. **/profile set <department> <year> <roadmaps>** - Set user profile.\n"
+                "    Example: /profile set CSE 2 python,javascript\n"
+                "30. **/progress [type]** - Track roadmap or study plan progress.\n"
+                "    Example: /progress python\n"
+                "31. **/recommend** - Get personalized resources, jobs, and mentors.\n"
+                "\n*Note*: Some features (e.g., /leaderboard, /career) are coming soon. Use inline buttons for quick actions."
+            )
+        ]
+        # Send each chunk separately
+        for chunk in help_text_chunks:
+            await update.message.reply_text(chunk, parse_mode='MarkdownV2')
+        # Add inline button for quick profile access
+        keyboard = [[InlineKeyboardButton("Set Profile", callback_data='set_profile'),
+                    InlineKeyboardButton("View Profile", callback_data='view_profile')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Use the buttons below to manage your profile:", reply_markup=reply_markup)
+    except TelegramError as e:
+        logger.error(f"Telegram error in help command: {e}")
+        await update.message.reply_text(f"Failed to display help due to a Telegram API issue: {str(e)}. Please try again or contact support.")
     except Exception as e:
         logger.error(f"Error in help command: {e}")
-        await update.message.reply_text("Error displaying help. Please try again or contact support.")
+        await update.message.reply_text(f"Error displaying help: {str(e)}. Please try again or contact support.")
 
 async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -462,9 +481,12 @@ async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response += f"- {event['name']} ({event['date']}): {event['details']}\n"
             reply_markup = None
         await update.message.reply_text(response, reply_markup=reply_markup)
+    except TelegramError as e:
+        logger.error(f"Telegram error in calendar command: {e}")
+        await update.message.reply_text(f"Failed to fetch calendar due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in calendar command: {e}")
-        await update.message.reply_text("Error fetching calendar. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching calendar. Please try again or contact support.")
 
 async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -498,9 +520,12 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for resource in MOCK_RESOURCES:
                 response += f"- {resource['title']} ({resource['platform']}): {resource['link']}\n"
         await update.message.reply_text(response)
+    except TelegramError as e:
+        logger.error(f"Telegram error in resources command: {e}")
+        await update.message.reply_text(f"Failed to fetch resources due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in resources command: {e}")
-        await update.message.reply_text("Error fetching resources. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching resources. Please try again or contact support.")
 
 async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -524,9 +549,12 @@ async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for repo in MOCK_TRENDING:
                 response += f"- {repo['repo']} ({repo['language']}, {repo['stars']} stars): {repo['description']}\n"
         await update.message.reply_text(response)
+    except TelegramError as e:
+        logger.error(f"Telegram error in trending command: {e}")
+        await update.message.reply_text(f"Failed to fetch trending repos due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in trending command: {e}")
-        await update.message.reply_text("Error fetching trending repos. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching trending repos. Please try again or contact support.")
 
 async def stackoverflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -550,9 +578,12 @@ async def stackoverflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for question in MOCK_STACKOVERFLOW:
                 response += f"- {question['title']} (Tags: {question['tags']}): {question['link']}\n"
         await update.message.reply_text(response)
+    except TelegramError as e:
+        logger.error(f"Telegram error in stackoverflow command: {e}")
+        await update.message.reply_text(f"Failed to fetch Stack Overflow questions due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in stackoverflow command: {e}")
-        await update.message.reply_text("Error fetching Stack Overflow questions. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching Stack Overflow questions. Please try again or contact support.")
 
 async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -589,9 +620,12 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response += f"- {job['title']} at {job['company']} ({job['location']}): {job['link']}\n"
             reply_markup = None
         await update.message.reply_text(response, reply_markup=reply_markup)
+    except TelegramError as e:
+        logger.error(f"Telegram error in jobs command: {e}")
+        await update.message.reply_text(f"Failed to fetch jobs due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in jobs command: {e}")
-        await update.message.reply_text("Error fetching jobs. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching jobs. Please try again or contact support.")
 
 async def roadmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -652,9 +686,12 @@ async def roadmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup = None
 
         await update.message.reply_text(response, reply_markup=reply_markup)
+    except TelegramError as e:
+        logger.error(f"Telegram error in roadmap command: {e}")
+        await update.message.reply_text(f"Failed to fetch roadmap due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in roadmap command: {e}")
-        await update.message.reply_text("Error fetching roadmap. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching roadmap. Please try again or contact support.")
 
 async def mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -698,9 +735,12 @@ async def mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup = None
 
         await update.message.reply_text(response, reply_markup=reply_markup)
+    except TelegramError as e:
+        logger.error(f"Telegram error in mentor command: {e}")
+        await update.message.reply_text(f"Failed to fetch mentors due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in mentor command: {e}")
-        await update.message.reply_text("Error fetching mentors. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching mentors. Please try again or contact support.")
 
 async def notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -722,9 +762,12 @@ async def notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for notice in MOCK_NOTICES:
                 response += f"- {notice['title']} ({notice['date']}): {notice['details']}\n"
         await update.message.reply_text(response)
+    except TelegramError as e:
+        logger.error(f"Telegram error in notice command: {e}")
+        await update.message.reply_text(f"Failed to fetch notices due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in notice command: {e}")
-        await update.message.reply_text("Error fetching notices. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching notices. Please try again or contact support.")
 
 async def collab(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -734,9 +777,12 @@ async def collab(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         post = " ".join(args[1:])
         await update.message.reply_text(f"Collaboration post created: {post}\nComing soon: Team matching feature.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in collab command: {e}")
+        await update.message.reply_text(f"Failed to post collaboration request due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in collab command: {e}")
-        await update.message.reply_text("Error posting collaboration request. Try again or use /help for details.")
+        await update.message.reply_text("Error posting collaboration request. Please try again or contact support.")
 
 async def events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -746,9 +792,12 @@ async def events(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for event in MOCK_EVENTS:
             response += f"- {event['name']} ({event['date']}): {event['details']}\n"
         await update.message.reply_text(response, reply_markup=reply_markup)
+    except TelegramError as e:
+        logger.error(f"Telegram error in events command: {e}")
+        await update.message.reply_text(f"Failed to fetch events due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in events command: {e}")
-        await update.message.reply_text("Error fetching events. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching events. Please try again or contact support.")
 
 async def links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -760,30 +809,42 @@ async def links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "- Developer Hub GitHub: https://github.com/UIU-Developer-Hub\n"
         )
         await update.message.reply_text(response)
+    except TelegramError as e:
+        logger.error(f"Telegram error in links command: {e}")
+        await update.message.reply_text(f"Failed to fetch links due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in links command: {e}")
-        await update.message.reply_text("Error fetching links. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching links. Please try again or contact support.")
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("Coming soon: Developer Recognition Leaderboard.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in leaderboard command: {e}")
+        await update.message.reply_text(f"Failed to fetch leaderboard due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in leaderboard command: {e}")
-        await update.message.reply_text("Error fetching leaderboard. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching leaderboard. Please try again or contact support.")
 
 async def meetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("Coming soon: UIU student-organized tech meetups and coding jams.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in meetup command: {e}")
+        await update.message.reply_text(f"Failed to fetch meetups due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in meetup command: {e}")
-        await update.message.reply_text("Error fetching meetups. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching meetups. Please try again or contact support.")
 
 async def internship(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("Use /jobs to find internships and job opportunities.\nSee /help for details.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in internship command: {e}")
+        await update.message.reply_text(f"Failed to fetch internships due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in internship command: {e}")
-        await update.message.reply_text("Error fetching internships. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching internships. Please try again or contact support.")
 
 async def cgpa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -802,6 +863,9 @@ async def cgpa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cgpa = df['Points'].mean()
         await update.message.reply_text(f"Your CGPA: {cgpa:.2f}\n{df.to_string(index=False)}")
+    except TelegramError as e:
+        logger.error(f"Telegram error in cgpa command: {e}")
+        await update.message.reply_text(f"Failed to calculate CGPA due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in cgpa command: {e}")
         await update.message.reply_text("Invalid format. Use: /cgpa cse321:A cse322:B+\nSee /help for details.")
@@ -817,9 +881,12 @@ async def gpapredict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     except ValueError:
         await update.message.reply_text("Please provide valid CGPA values, e.g., /gpapredict 3.5 3.8\nSee /help for details.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in gpapredict command: {e}")
+        await update.message.reply_text(f"Failed to predict CGPA due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in gpapredict command: {e}")
-        await update.message.reply_text("Error predicting CGPA. Try again or use /help for details.")
+        await update.message.reply_text("Error predicting CGPA. Please try again or contact support.")
 
 async def scholarships(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -827,9 +894,12 @@ async def scholarships(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for scholarship in MOCK_SCHOLARSHIPS:
             response += f"- {scholarship['name']}: {scholarship['details']} ({scholarship['link']})\n"
         await update.message.reply_text(response)
+    except TelegramError as e:
+        logger.error(f"Telegram error in scholarships command: {e}")
+        await update.message.reply_text(f"Failed to fetch scholarships due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in scholarships command: {e}")
-        await update.message.reply_text("Error fetching scholarships. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching scholarships. Please try again or contact support.")
 
 async def academic_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await calendar(update, context)
@@ -837,9 +907,12 @@ async def academic_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def career(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("Coming soon: Career Office updates, CV workshops, and recruitment drives.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in career command: {e}")
+        await update.message.reply_text(f"Failed to fetch career updates due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in career command: {e}")
-        await update.message.reply_text("Error fetching career updates. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching career updates. Please try again or contact support.")
 
 async def fyp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -851,9 +924,12 @@ async def fyp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Coming soon: Trending FYP ideas from UIU alumni.")
         elif args[0].lower() == "docs":
             await update.message.reply_text("Coming soon: FYP guidelines, formats, and past submissions.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in fyp command: {e}")
+        await update.message.reply_text(f"Failed to fetch FYP info due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in fyp command: {e}")
-        await update.message.reply_text("Error fetching FYP info. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching FYP info. Please try again or contact support.")
 
 async def studyplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -877,9 +953,12 @@ async def studyplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     except ValidationError as e:
         await update.message.reply_text(f"Invalid input: {e}\nSee /help for details.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in studyplan command: {e}")
+        await update.message.reply_text(f"Failed to create study plan due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in studyplan command: {e}")
-        await update.message.reply_text("Error creating study plan. Try again or use /help for details.")
+        await update.message.reply_text("Error creating study plan. Please try again or contact support.")
 
 async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -921,13 +1000,18 @@ async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = "Your Reminders:\n" + "\n".join(f"- {task} ({deadline}, {recurrence})" for task, deadline, recurrence in reminders)
             await update.message.reply_text(response or "No reminders set.")
         conn.close()
+    except TelegramError as e:
+        logger.error(f"Telegram error in reminders command: {e}")
+        await update.message.reply_text(f"Failed to set/list reminders due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in reminders command: {e}")
-        await update.message.reply_text("Error setting/listing reminders. Try again or use /help for details.")
+        await update.message.reply_text("Error setting/listing reminders. Please try again or contact support.")
 
 async def send_reminder(bot, user_id, task):
     try:
         await bot.send_message(user_id, f"Reminder: {task} is due today!")
+    except TelegramError as e:
+        logger.error(f"Telegram error sending reminder: {e}")
     except Exception as e:
         logger.error(f"Error sending reminder: {e}")
 
@@ -948,9 +1032,12 @@ async def motivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if profile and profile[1]:
             tips.append(f"Stay focused on your {profile[1]} studies. You're building a bright future!")
         await update.message.reply_text(random.choice(tips))
+    except TelegramError as e:
+        logger.error(f"Telegram error in motivate command: {e}")
+        await update.message.reply_text(f"Failed to fetch motivational tip due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in motivate command: {e}")
-        await update.message.reply_text("Error fetching motivational tip. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching motivational tip. Please try again or contact support.")
 
 async def codeshare(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -982,9 +1069,12 @@ async def codeshare(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = "Your Code Snippets:\n" + "\n".join(f"- {desc} (Tags: {tags}): {code}" for desc, tags, code in snippets)
             await update.message.reply_text(response or "No snippets found.")
         conn.close()
+    except TelegramError as e:
+        logger.error(f"Telegram error in codeshare command: {e}")
+        await update.message.reply_text(f"Failed to handle code snippets due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in codeshare command: {e}")
-        await update.message.reply_text("Error handling code snippets. Try again or use /help for details.")
+        await update.message.reply_text("Error handling code snippets. Please try again or contact support.")
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1003,9 +1093,12 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Profile updated: {profile.department}, Year {profile.year}, Roadmaps: {profile.favorite_roadmaps}")
     except ValidationError as e:
         await update.message.reply_text(f"Invalid input: {e}\nSee /help for details.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in profile command: {e}")
+        await update.message.reply_text(f"Failed to set profile due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in profile command: {e}")
-        await update.message.reply_text("Error setting profile. Try again or use /help for details.")
+        await update.message.reply_text("Error setting profile. Please try again or contact support.")
 
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1026,9 +1119,12 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response)
         else:
             await update.message.reply_text(f"No progress tracked for {roadmap_type}. Start with /studyplan or /roadmap.\nSee /help for details.")
+    except TelegramError as e:
+        logger.error(f"Telegram error in progress command: {e}")
+        await update.message.reply_text(f"Failed to fetch progress due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in progress command: {e}")
-        await update.message.reply_text("Error fetching progress. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching progress. Please try again or contact support.")
 
 async def recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1070,9 +1166,12 @@ async def recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             response += "Set your profile with /profile to get personalized recommendations.\nSee /help for details."
         await update.message.reply_text(response)
+    except TelegramError as e:
+        logger.error(f"Telegram error in recommend command: {e}")
+        await update.message.reply_text(f"Failed to fetch recommendations due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in recommend command: {e}")
-        await update.message.reply_text("Error fetching recommendations. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching recommendations. Please try again or contact support.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1131,14 +1230,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("To add a job application reminder, use /reminders add 'Apply for Job Title' YYYY-MM-DD\nSee /help for details.")
         elif query.data == 'help':
             await help(update, context)
+    except TelegramError as e:
+        logger.error(f"Telegram error in button callback: {e}")
+        await query.message.reply_text(f"Failed to process button action due to a Telegram API issue: {str(e)}. Please try again.")
     except Exception as e:
         logger.error(f"Error in button callback: {e}")
-        await query.message.reply_text("Error processing your request. Try again or use /help for details.")
+        await query.message.reply_text("Error processing your request. Please try again or contact support.")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
     if update and update.message:
-        await update.message.reply_text(f"An error occurred: {str(context.error)}. Please try again or use /help for details.")
+        error_message = str(context.error)
+        if isinstance(context.error, TelegramError):
+            error_message = f"Telegram API error: {error_message}"
+        await update.message.reply_text(f"An error occurred: {error_message}. Please try again or contact support.")
 
 # Webhook handler
 async def webhook_handler(request: web.Request) -> web.Response:
@@ -1201,49 +1306,53 @@ async def setup_application():
             application.add_handler(CallbackQueryHandler(button_callback))
             application.add_error_handler(error_handler)
 
-            await application.initialize()
-            await application.start()
+            # Setup webhook with retry logic
+            async def set_webhook():
+                retries = 3
+                for attempt in range(retries):
+                    try:
+                        await application.bot.set_webhook(url=WEBHOOK_URL)
+                        logger.info(f"Webhook set successfully to {WEBHOOK_URL}")
+                        return
+                    except TelegramError as e:
+                        logger.error(f"Attempt {attempt + 1} to set webhook failed: {e}")
+                        if attempt < retries - 1:
+                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                        else:
+                            raise Exception(f"Failed to set webhook after {retries} attempts: {e}")
 
-            # Check current webhook
-            webhook_info = await application.bot.get_webhook_info()
-            if webhook_info.url != WEBHOOK_URL:
-                await application.bot.delete_webhook(drop_pending_updates=True)
-                await application.bot.set_webhook(url=WEBHOOK_URL)
-                logger.info(f"Webhook set to {WEBHOOK_URL}")
-            else:
-                logger.info(f"Webhook already set to {WEBHOOK_URL}")
-            return
+            # Initialize webhook
+            await set_webhook()
+
+            # Setup aiohttp web server
+            app = web.Application()
+            app.router.add_post('/webhook', webhook_handler)
+            app.router.add_get('/health', health_check)
+
+            # Start the web server
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, '0.0.0.0', PORT)
+            await site.start()
+            logger.info(f"Webhook server started on port {PORT}")
+
+            return app  # Return app to keep the server running
+
         except Exception as e:
-            logger.error(f"Setup attempt {attempt + 1} failed: {e}")
+            logger.error(f"Application setup attempt {attempt + 1} failed: {e}")
             if attempt < retries - 1:
-                await asyncio.sleep(2)
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
             else:
-                raise
+                raise Exception(f"Failed to setup application after {retries} attempts: {e}")
 
-# Main function to run webhook server
-async def main():
-    try:
-        # Create aiohttp app
-        app = web.Application()
-        app.router.add_post('/webhook', webhook_handler)
-        app.router.add_get('/', health_check)
-
-        # Setup Telegram application
-        await setup_application()
-
-        # Start webhook server
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', PORT)
-        await site.start()
-        logger.info(f"Webhook server running on port {PORT}")
-
-        # Keep the application running
-        while True:
-            await asyncio.sleep(3600)
-    except Exception as e:
-        logger.error(f"Error in main: {e}")
-        raise
-
+# Main execution
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        loop = asyncio.get_event_loop()
+        app = loop.run_until_complete(setup_application())
+        loop.run_forever()  # Keep the server running
+    except KeyboardInterrupt:
+        logger.info("Shutting down the bot")
+    except Exception as e:
+        logger.error(f"Fatal error in main loop: {e}")
+        raise
