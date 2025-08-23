@@ -55,35 +55,6 @@ Installation
    python app.py
    The bot will set up a webhook at WEBHOOK_URL and run on PORT.
 
-Requirements
-The requirements.txt includes:
-python-telegram-bot==20.7
-polars==0.20.31
-rapidfuzz==3.9.7
-trafilatura==1.12.2
-wikipedia-api==0.7.1
-wikipedia==1.4.0
-aiohttp==3.9.5
-aiosignal==1.3.1
-async-timeout==4.0.3
-attrs==23.2.0
-certifi==2024.8.30
-charset-normalizer==3.3.2
-courlan==1.3.0
-frozenlist==1.4.1
-h11==0.14.0
-htmldate==1.8.1
-idna==3.7
-justext==3.0.1
-lxml==5.2.2
-multidict==6.0.5
-numpy==1.26.4
-pyarrow==14.0.2
-python-dateutil==2.9.0.post0
-requests==2.31.0
-six==1.16.0
-urllib3==2.2.2
-yarl==1.9.4
 
 Usage
 1. Start the bot: /start
