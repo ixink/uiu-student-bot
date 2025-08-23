@@ -194,7 +194,7 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = (
             "🏫 *About UIU Developer Hub*\n\n"
             f"{about_text}\n\n"
-            "Visit https://www.uiu.ac.bd/clubs/developer-hub for more details."
+            "Visit https://www.facebook.com/uiudevelopershub for more details."
         )
         await update.message.reply_text(response, parse_mode='Markdown')
     except Exception as e:
