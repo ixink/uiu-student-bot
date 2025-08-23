@@ -138,7 +138,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
             "Welcome to UIU Buddy Bot! 🎓\n"
-            f"Find study partners, ride shares, and more. View your dashboard at http://localhost:{STREAMLIT_PORT}",
+            f"Find study partners, ride shares, and more.",
             reply_markup=reply_markup
         )
     except Exception as e:
