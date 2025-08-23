@@ -4,6 +4,9 @@ import pandas as pd
 import random
 import requests
 import os
+import json
+import time
+import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
@@ -14,8 +17,7 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel, ValidationError
-import json
-import time
+from aiohttp import web
 from typing import List, Dict
 from requests.exceptions import HTTPError, ConnectionError, Timeout
 
@@ -23,8 +25,10 @@ from requests.exceptions import HTTPError, ConnectionError, Timeout
 logging.config.fileConfig('logging.conf')
 logger = logging.getLogger(__name__)
 
-# Bot token from environment variable
+# Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://uiu-student-bot.onrender.com/webhook")
+PORT = int(os.getenv("PORT", 8443))
 
 # Initialize SQLite database
 def init_db():
@@ -122,7 +126,7 @@ class FacultySpider(scrapy.Spider):
         "https://sobe.uiu.ac.bd/bba-faculty/",
         "https://pharmacy.uiu.ac.bd/faculty-members/",
         "https://ins.uiu.ac.bd/faculty-members/",
-        "https://www.uiu.ac.bd/faculty-members/"  # For Economics, English, EDS, MSJ, BGE
+        "https://www.uiu.ac.bd/faculty-members/"
     ]
 
     def parse(self, response):
@@ -1079,14 +1083,35 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
-    await update.message.reply_text("An error occurred. Please try again or use /help for command details.")
+    if update.message:
+        await update.message.reply_text("An error occurred. Please try again or use /help for command details.")
 
-def main():
+# Webhook handler
+async def webhook_handler(request: web.Request) -> web.Response:
+    try:
+        update = Update.de_json(await request.json(), application.bot)
+        if update:
+            await application.process_update(update)
+        return web.Response(status=200)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return web.Response(status=500)
+
+# Health check endpoint
+async def health_check(request: web.Request) -> web.Response:
+    return web.Response(text="UIU Student Bot is running", status=200)
+
+# Setup Telegram application and webhook
+async def setup_application():
     try:
         if not BOT_TOKEN:
             logger.error("BOT_TOKEN environment variable not set")
             raise ValueError("BOT_TOKEN not set")
+        
+        global application
         application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Add handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help))
         application.add_handler(CommandHandler("calendar", calendar))
@@ -1118,10 +1143,42 @@ def main():
         application.add_handler(CommandHandler("recommend", recommend))
         application.add_handler(CallbackQueryHandler(button_callback))
         application.add_error_handler(error_handler)
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+        # Initialize application
+        await application.initialize()
+        await application.start()
+        
+        # Set webhook
+        await application.bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"Webhook set to {WEBHOOK_URL}")
     except Exception as e:
-        logger.error(f"Error starting bot: {e}")
-        print("Failed to start bot. Check BOT_TOKEN and dependencies.")
+        logger.error(f"Error setting up application: {e}")
+        raise
+
+# Main function to run webhook server
+async def main():
+    try:
+        # Create aiohttp app
+        app = web.Application()
+        app.router.add_post('/webhook', webhook_handler)
+        app.router.add_get('/', health_check)
+        
+        # Setup Telegram application
+        await setup_application()
+        
+        # Start webhook server
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
+        logger.info(f"Webhook server running on port {PORT}")
+        
+        # Keep the application running
+        while True:
+            await asyncio.sleep(3600)
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        raise
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
