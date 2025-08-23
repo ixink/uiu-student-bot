@@ -1,28 +1,22 @@
 import logging
 import sqlite3
-import pandas as pd
+import polars as pl
 import random
 import os
 import json
 import time
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
-from twisted.internet import reactor
-from scrapy.crawler import CrawlerRunner
-from scrapy.utils.log import configure_logging
-from scrapy import signals
-from scrapy.signalmanager import dispatcher
-import scrapy
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pydantic import BaseModel, ValidationError
+import trafilatura
+import aiohttp
+from rapidfuzz import fuzz
+import streamlit as st
+import wikipediaapi
 from aiohttp import web
 from typing import List, Dict
-from requests.exceptions import HTTPError, ConnectionError, Timeout
+from urllib.parse import urljoin
 
 # Configure logging
 logging.basicConfig(
@@ -36,46 +30,39 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://uiu-student-bot.onrender.com/webhook")
 PORT = int(os.getenv("PORT", 8443))
+STREAMLIT_PORT = int(os.getenv("STREAMLIT_PORT", 8501))
 
-# Initialize SQLite database with retry logic
+# Initialize SQLite database
 def init_db():
-    retries = 3
-    for attempt in range(retries):
-        try:
-            conn = sqlite3.connect('uiu_bot.db', timeout=10)
-            c = conn.cursor()
-            c.execute('''CREATE TABLE IF NOT EXISTS reminders (
-                user_id INTEGER, task TEXT, deadline TEXT, recurrence TEXT
-            )''')
-            c.execute('''CREATE TABLE IF NOT EXISTS code_snippets (
-                user_id INTEGER, description TEXT, tags TEXT, snippet TEXT
-            )''')
-            c.execute('''CREATE TABLE IF NOT EXISTS roadmaps (
-                roadmap_type TEXT, level TEXT, title TEXT, steps TEXT, resources TEXT, projects TEXT, last_updated REAL
-            )''')
-            c.execute('''CREATE TABLE IF NOT EXISTS user_profiles (
-                user_id INTEGER PRIMARY KEY, department TEXT, year INTEGER, favorite_roadmaps TEXT
-            )''')
-            c.execute('''CREATE TABLE IF NOT EXISTS progress (
-                user_id INTEGER, roadmap_type TEXT, level TEXT, completed_steps TEXT
-            )''')
-            c.execute('''CREATE TABLE IF NOT EXISTS faculty (
-                name TEXT, designation TEXT, department TEXT, email TEXT, phone TEXT, expertise TEXT, last_updated REAL
-            )''')
-            conn.commit()
-            logger.info("Database initialized successfully")
-            return conn
-        except sqlite3.OperationalError as e:
-            logger.error(f"Database init attempt {attempt + 1} failed: {e}")
-            if attempt < retries - 1:
-                time.sleep(1)
-            else:
-                raise
-        finally:
-            if 'conn' in locals():
-                conn.close()
+    try:
+        conn = sqlite3.connect('uiu_bot.db', timeout=10)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS reminders (
+            user_id INTEGER, task TEXT, deadline TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS code_snippets (
+            user_id INTEGER, description TEXT, tags TEXT, snippet TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id INTEGER PRIMARY KEY, department TEXT, year INTEGER, favorite_roadmaps TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS progress (
+            user_id INTEGER, roadmap_type TEXT, level TEXT, completed_steps TEXT
+        )''')
+        conn.commit()
+        logger.info("Database initialized successfully")
+        return conn
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database initialization failed: {e}")
+        raise
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 init_db()
+
+# Initialize Wikipedia API
+wiki = wikipediaapi.Wikipedia('UIUDeveloperHubBot/1.0 (https://uiu.ac.bd)', 'en')
 
 # Temporary in-memory storage
 temp_calendar: List[Dict] = []
@@ -85,7 +72,6 @@ temp_stackoverflow: List[Dict] = []
 temp_jobs: List[Dict] = []
 temp_notices: List[Dict] = []
 temp_faculty: List[Dict] = []
-temp_faculty_urls = set()
 
 # Mock data for fallback
 MOCK_NOTICES = [
@@ -105,10 +91,7 @@ MOCK_ROADMAP = {
     "projects": ["Build a small app"]
 }
 MOCK_FACULTY = [
-    {"name": "Dr. Suman Ahmmed", "designation": "Head", "department": "CSE", "email": "suman@cse.uiu.ac.bd", "phone": "N/A", "expertise": "AI, ML"},
-    {"name": "Dr. Rumana Afrin", "designation": "Head", "department": "Civil Engineering", "email": "rumana@ce.uiu.ac.bd", "phone": "N/A", "expertise": "Structural Engineering"},
-    {"name": "Dr. Mohammad Musa", "designation": "Dean", "department": "Business Administration", "email": "musa@sobe.uiu.ac.bd", "phone": "N/A", "expertise": "Finance"},
-    {"name": "Dr. Mohammad Omar Farooq", "designation": "Head", "department": "Economics", "email": "farooq@sobe.uiu.ac.bd", "phone": "N/A", "expertise": "Economic Policy"}
+    {"name": "Dr. Suman Ahmmed", "designation": "Head", "department": "CSE", "email": "suman@cse.uiu.ac.bd", "phone": "N/A", "expertise": "AI, ML"}
 ]
 MOCK_JOBS = [
     {"title": "AI Internship at Grameenphone", "company": "Grameenphone", "location": "Remote", "link": "http://example.com"}
@@ -123,259 +106,20 @@ MOCK_STACKOVERFLOW = [
     {"title": "How to debug Python code", "tags": "python, debugging", "link": "https://stackoverflow.com/questions/12345"}
 ]
 
-# Scrapy Spiders
-class RoadmapSpider(scrapy.Spider):
-    name = "roadmap"
-    def __init__(self, roadmap_type="python", *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.start_urls = [f"https://roadmap.sh/{roadmap_type}"]
-
-    def parse(self, response):
+# Web scraping with Trafilatura
+async def fetch_web_content(url: str) -> str:
+    async with aiohttp.ClientSession() as session:
         try:
-            conn = sqlite3.connect('uiu_bot.db', timeout=10)
-            c = conn.cursor()
-            roadmap_type = response.url.split('/')[-1]
-            levels = ['beginner', 'intermediate', 'advanced']
-            for level in levels:
-                section = response.css(f'div[data-level="{level}"]') or response.css('div.roadmap-section')
-                title = section.css('h2::text').get(default=f"{level.capitalize()} {roadmap_type.capitalize()} Roadmap")
-                steps = section.css('ul.steps li::text').getall() or ["Step not found"]
-                resources = section.css('ul.resources li a::text').getall() or ["Resource not found"]
-                projects = section.css('ul.projects li::text').getall() or ["Project not found"]
-                c.execute(
-                    "INSERT OR REPLACE INTO roadmaps (roadmap_type, level, title, steps, resources, projects, last_updated) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (roadmap_type, level, title, json.dumps(steps), json.dumps(resources), json.dumps(projects), time.time())
-                )
-            conn.commit()
+            async with session.get(url, timeout=10) as response:
+                html = await response.text()
+                return trafilatura.extract(html, include_links=True) or ""
         except Exception as e:
-            logger.error(f"Error parsing roadmap data: {e}")
-        finally:
-            conn.close()
-
-class FacultySpider(scrapy.Spider):
-    name = "faculty"
-    start_urls = [
-        "https://cse.uiu.ac.bd/faculty-members/",
-        "https://eee.uiu.ac.bd/faculty/",
-        "https://ce.uiu.ac.bd/faculty-members/",
-        "https://sobe.uiu.ac.bd/bba-faculty/",
-        "https://pharmacy.uiu.ac.bd/faculty-members/",
-        "https://ins.uiu.ac.bd/faculty-members/",
-        "https://www.uiu.ac.bd/faculty-members/"
-    ]
-
-    def parse(self, response):
-        global temp_faculty, temp_faculty_urls
-        if response.url not in temp_faculty_urls:
-            temp_faculty_urls.add(response.url)
-            try:
-                faculty_list = response.css('div.faculty-member, tr.member, div.staff-card, li.faculty')
-                for faculty in faculty_list:
-                    name = faculty.css('h3::text, td.name::text, .faculty-name::text').get(default="Unknown").strip()
-                    designation = faculty.css('p.designation::text, td.designation::text, .faculty-title::text').get(default="N/A").strip()
-                    department = self.get_department(response.url)
-                    email = faculty.css('a.email::text, td.email::text, .faculty-email::text').get(default="N/A").strip()
-                    phone = faculty.css('span.phone::text, td.phone::text, .faculty-phone::text').get(default="N/A").strip()
-                    expertise = faculty.css('p.expertise::text, td.expertise::text, .faculty-expertise::text').get(default="N/A").strip()
-                    temp_faculty.append({
-                        "name": name, "designation": designation, "department": department,
-                        "email": email, "phone": phone, "expertise": expertise
-                    })
-            except Exception as e:
-                logger.error(f"Error parsing faculty data from {response.url}: {e}")
-
-    def get_department(self, url):
-        if "cse.uiu.ac.bd" in url:
-            return "Computer Science and Engineering"
-        elif "eee.uiu.ac.bd" in url:
-            return "Electrical and Electronic Engineering"
-        elif "ce.uiu.ac.bd" in url:
-            return "Civil Engineering"
-        elif "sobe.uiu.ac.bd" in url:
-            return "Business Administration"
-        elif "pharmacy.uiu.ac.bd" in url:
-            return "Pharmacy"
-        elif "ins.uiu.ac.bd" in url:
-            return "Institute of Natural Sciences"
-        else:
-            return "Economics, English, EDS, MSJ, or BGE"
-
-class CalendarSpider(scrapy.Spider):
-    name = "calendar"
-    start_urls = ["https://www.uiu.ac.bd/academic-calendars"]
-
-    def parse(self, response):
-        global temp_calendar
-        temp_calendar = []
-        try:
-            events = response.css('div.event-item, li.event')[:5]
-            for event in events:
-                name = event.css('h3::text, .event-title::text').get(default="No title")
-                date = event.css('time::text, .event-date::text').get(default="No date")
-                details = event.css('p::text, .event-details::text').get(default="No details")
-                temp_calendar.append({"name": name, "date": date, "details": details})
-        except Exception as e:
-            logger.error(f"Error parsing calendar data: {e}")
-
-class ResourcesSpider(scrapy.Spider):
-    name = "resources"
-    start_urls = [
-        "https://www.freecodecamp.org/learn/",
-        "https://www.coursera.org/courses?query=open%20source",
-        "https://www.edx.org/search?q=open%20source"
-    ]
-
-    def parse(self, response):
-        global temp_resources
-        try:
-            courses = response.css('div.course-item, li.course')[:5]
-            for course in courses:
-                title = course.css('h2::text, .course-title::text').get(default="No title")
-                platform = response.url.split('/')[2].replace('www.', '')
-                link = course.css('a::attr(href)').get(default="#")
-                if not link.startswith('http'):
-                    link = f"https://{platform}{link}"
-                temp_resources.append({"title": title, "platform": platform, "link": link})
-        except Exception as e:
-            logger.error(f"Error parsing resources: {e}")
-
-class TrendingSpider(scrapy.Spider):
-    name = "trending"
-    def __init__(self, language=None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        url = "https://github.com/trending" if not language else f"https://github.com/trending/{language}"
-        self.start_urls = [url]
-
-    def parse(self, response):
-        global temp_trending
-        try:
-            repos = response.css('article.Box-row')[:5]
-            for repo in repos:
-                repo_name = repo.css('h1 a::text').get(default="No name").strip()
-                description = repo.css('p::text').get(default="No description").strip()
-                language = repo.css('span[itemprop="programmingLanguage"]::text').get(default="Unknown")
-                stars = repo.css('a[href*="/stargazers"]::text').get(default="0").strip()
-                temp_trending.append({"repo": repo_name, "description": description, "language": language, "stars": stars})
-        except Exception as e:
-            logger.error(f"Error parsing trending repos: {e}")
-
-class StackOverflowSpider(scrapy.Spider):
-    name = "stackoverflow"
-    def __init__(self, tag=None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        url = "https://stackoverflow.com/questions" if not tag else f"https://stackoverflow.com/questions/tagged/{tag}"
-        self.start_urls = [url]
-
-    def parse(self, response):
-        global temp_stackoverflow
-        try:
-            questions = response.css('div.question-summary')[:5]
-            for question in questions:
-                title = question.css('h3 a::text').get(default="No title")
-                tags = question.css('div.tags a::text').getall()
-                link = question.css('h3 a::attr(href)').get(default="#")
-                temp_stackoverflow.append({"title": title, "tags": ",".join(tags), "link": f"https://stackoverflow.com{link}"})
-        except Exception as e:
-            logger.error(f"Error parsing Stack Overflow: {e}")
-
-class JobsSpider(scrapy.Spider):
-    name = "jobs"
-    start_urls = [
-        "https://www.internshala.com/internships",
-        "https://www.bdjobs.com/",
-        "https://www.linkedin.com/jobs/search/?keywords=internship&location=Bangladesh",
-        "https://weworkremotely.com/"
-    ]
-
-    def parse(self, response):
-        global temp_jobs
-        try:
-            if "internshala" in response.url:
-                jobs = response.css('div.internship_meta')[:5]
-                for job in jobs:
-                    title = job.css('h3::text').get(default="No title").strip()
-                    company = job.css('a.company_name::text').get(default="Unknown").strip()
-                    location = job.css('div.location::text').get(default="Remote").strip()
-                    link = job.css('a.view_detail_button::attr(href)').get(default="#")
-                    temp_jobs.append({"title": title, "company": company, "location": location, "link": f"https://www.internshala.com{link}"})
-            elif "bdjobs" in response.url:
-                jobs = response.css('div.job-list-item')[:5]
-                for job in jobs:
-                    title = job.css('h2::text').get(default="No title").strip()
-                    company = job.css('span.company::text').get(default="Unknown").strip()
-                    location = job.css('span.location::text').get(default="Unknown").strip()
-                    link = job.css('a::attr(href)').get(default="#")
-                    temp_jobs.append({"title": title, "company": company, "location": location, "link": link})
-            elif "linkedin" in response.url:
-                jobs = response.css('div.job-card')[:5]
-                for job in jobs:
-                    title = job.css('h3::text').get(default="No title").strip()
-                    company = job.css('h4::text').get(default="Unknown").strip()
-                    location = job.css('span.job-location::text').get(default="Remote").strip()
-                    link = job.css('a::attr(href)').get(default="#")
-                    temp_jobs.append({"title": title, "company": company, "location": location, "link": link})
-            elif "weworkremotely" in response.url:
-                jobs = response.css('li.feature')[:5]
-                for job in jobs:
-                    title = job.css('span.title::text').get(default="No title").strip()
-                    company = job.css('span.company::text').get(default="Unknown").strip()
-                    location = "Remote"
-                    link = job.css('a::attr(href)').get(default="#")
-                    temp_jobs.append({"title": title, "company": company, "location": location, "link": f"https://weworkremotely.com{link}"})
-        except Exception as e:
-            logger.error(f"Error parsing jobs: {e}")
-
-class NoticeSpider(scrapy.Spider):
-    name = "uiu_notice"
-    start_urls = ["https://www.uiu.ac.bd"]
-
-    def parse(self, response):
-        global temp_notices
-        try:
-            notices = response.css('div.news-section article')[:3]
-            for notice in notices:
-                title = notice.css('h2::text').get() or "No title"
-                date = notice.css('time::text').get() or "No date"
-                details = notice.css('p::text').get() or "No details"
-                temp_notices.append({"title": title, "date": date, "details": details})
-        except Exception as e:
-            logger.error(f"Error parsing notices: {e}")
-
-# Selenium Scraper for dynamic content
-def scrape_dynamic_content(url, retries=2):
-    for attempt in range(retries):
-        try:
-            options = webdriver.ChromeOptions()
-            options.add_argument('--headless')
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-            driver.get(url)
-            time.sleep(2)
-            content = driver.page_source
-            driver.quit()
-            return content
-        except Exception as e:
-            logger.error(f"Attempt {attempt + 1} failed for {url}: {e}")
-            time.sleep(1)
-    return None
-
-# Pydantic models
-class StudyPlan(BaseModel):
-    courses: list[str]
-    hours_per_week: int
-    target_date: str
-    priority: str
-
-class UserProfile(BaseModel):
-    department: str
-    year: int
-    favorite_roadmaps: str
+            logger.error(f"Error fetching {url}: {e}")
+            return ""
 
 # Rate limiting
 user_last_scrape = {}
-RATE_LIMIT_SECONDS = 60
+RATE_LIMIT_SECONDS = 30
 
 def can_scrape(user_id):
     last_scrape = user_last_scrape.get(user_id, 0)
@@ -383,20 +127,6 @@ def can_scrape(user_id):
         return False
     user_last_scrape[user_id] = time.time()
     return True
-
-# Async Scrapy runner
-async def run_spider(spider_class, **kwargs):
-    configure_logging()
-    runner = CrawlerRunner({
-        'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'CONCURRENT_REQUESTS': 16,
-        'DOWNLOAD_DELAY': 0.5,
-    })
-    deferred = runner.crawl(spider_class, **kwargs)
-    # Wait for Scrapy to finish
-    while not deferred.called:
-        await asyncio.sleep(0.1)
-    return deferred.result
 
 # Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -408,13 +138,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            "Welcome to the UIU Developer Hub Bot! 🎓\n"
-            "Use /help for a list of commands and usage instructions.",
+            f"Welcome to the UIU Developer Hub Bot! 🎓\n"
+            f"Use /help for commands. View your dashboard at http://localhost:{STREAMLIT_PORT}",
             reply_markup=reply_markup
         )
     except Exception as e:
         logger.error(f"Error in start command: {e}")
-        await update.message.reply_text("Error starting the bot. Please try again or use /help for details.")
+        await update.message.reply_text("Error starting the bot. Please try again.")
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -423,7 +153,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "1. **/start** - Start the bot and see welcome message.\n"
             "2. **/help** - Show this help message with all commands.\n"
             "3. **/calendar** - View UIU academic calendar events.\n"
-            "4. **/resources [keyword]** - Find open-source learning resources.\n"
+            "4. **/resources [keyword]** - Find learning resources with Wikipedia summaries.\n"
             "   Example: /resources python\n"
             "5. **/trending [language]** - View GitHub trending repositories.\n"
             "   Example: /trending javascript\n"
@@ -431,43 +161,30 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "   Example: /stackoverflow python\n"
             "7. **/jobs [keyword]** - Find job and internship opportunities.\n"
             "   Example: /jobs internship\n"
-            "8. **/roadmap <type> [level]** - Get a learning roadmap from roadmap.sh.\n"
+            "8. **/roadmap <type> [level]** - Get a learning roadmap with Wikipedia context.\n"
             "   Example: /roadmap python beginner\n"
             "9. **/mentor find <department|expertise>** - Find UIU faculty mentors.\n"
             "   Example: /mentor find CSE\n"
             "10. **/notice** - View latest UIU notices.\n"
-            "11. **/collab post <message>** - Post a collaboration request.\n"
-            "    Example: /collab post Looking for hackathon teammates\n"
-            "12. **/events** - View upcoming UIU events.\n"
-            "13. **/links** - Get university service links (UCAM, Library, etc.).\n"
-            "14. **/leaderboard** - View developer recognition leaderboard (coming soon).\n"
-            "15. **/meetup** - View tech meetups and coding jams (coming soon).\n"
-            "16. **/internship** - Find internships (use /jobs).\n"
-            "17. **/cgpa <course:grade>** - Calculate CGPA.\n"
+            "11. **/links** - Get university service links (UCAM, Library, etc.).\n"
+            "12. **/cgpa <course:grade>** - Calculate CGPA.\n"
             "    Example: /cgpa cse321:A cse322:B+\n"
-            "18. **/gpapredict <current_cgpa> <target_cgpa>** - Predict grades needed.\n"
-            "    Example: /gpapredict 3.5 3.8\n"
-            "19. **/scholarships** - View scholarship opportunities.\n"
-            "20. **/academic** - View academic calendar (same as /calendar).\n"
-            "21. **/career** - Career office updates (coming soon).\n"
-            "22. **/fyp <ideas|docs>** - Get FYP ideas or documentation (coming soon).\n"
-            "    Example: /fyp ideas\n"
-            "23. **/studyplan <courses> <hours> <date> <priority>** - Create a study plan.\n"
+            "13. **/scholarships** - View scholarship opportunities.\n"
+            "14. **/studyplan <courses> <hours> <date> <priority>** - Create a study plan.\n"
             "    Example: /studyplan cse321,cse322 10 2025-12-01 cse321:1,cse322:2\n"
-            "24. **/reminders add <task> <date> [recurrence]** - Set reminders.\n"
-            "    Example: /reminders add Meet Dr. Suman 2025-09-01 weekly\n"
-            "25. **/reminders list** - List all reminders.\n"
-            "26. **/motivate** - Get motivational tips.\n"
-            "27. **/codeshare add <description> <tags> <code>** - Share code snippets.\n"
+            "15. **/reminders add <task> <date>** - Set reminders.\n"
+            "    Example: /reminders add Meet Dr. Suman 2025-09-01\n"
+            "16. **/reminders list** - List all reminders.\n"
+            "17. **/motivate** - Get motivational tips.\n"
+            "18. **/codeshare add <description> <tags> <code>** - Share code snippets.\n"
             "    Example: /codeshare add BubbleSort python def bubble_sort(arr):...\n"
-            "28. **/codeshare list [tag]** - List your code snippets.\n"
+            "19. **/codeshare list [tag]** - List your code snippets.\n"
             "    Example: /codeshare list python\n"
-            "29. **/profile set <department> <year> <roadmaps>** - Set user profile.\n"
+            "20. **/profile set <department> <year> <roadmaps>** - Set user profile.\n"
             "    Example: /profile set CSE 2 python,javascript\n"
-            "30. **/progress [type]** - Track roadmap or study plan progress.\n"
+            "21. **/progress [type]** - Track roadmap or study plan progress.\n"
             "    Example: /progress python\n"
-            "31. **/recommend** - Get personalized resources, jobs, and mentors.\n"
-            "\n*Note*: Some features (e.g., /leaderboard, /career) are coming soon due to data access limitations. Use inline buttons for quick actions."
+            "22. **/recommend** - Get personalized resources, jobs, and mentors.\n"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
     except Exception as e:
@@ -478,12 +195,18 @@ async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = update.effective_user.id
         if not can_scrape(user_id):
-            await update.message.reply_text("Please wait a minute before requesting another calendar.")
+            await update.message.reply_text("Please wait 30 seconds before requesting another calendar.")
             return
 
         global temp_calendar
         temp_calendar = []
-        await run_spider(CalendarSpider)
+        content = await fetch_web_content("https://www.uiu.ac.bd/academic-calendars")
+        if content:
+            # Parse events using Trafilatura's extracted text
+            lines = content.split('\n')
+            for line in lines[:5]:
+                if any(kw in line.lower() for kw in ['event', 'seminar', 'holiday', 'exam']):
+                    temp_calendar.append({"name": line.strip(), "date": "N/A", "details": line.strip()})
 
         if temp_calendar:
             response = "UIU Academic Calendar Events:\n"
@@ -507,12 +230,31 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
         keyword = args[0].lower() if args else None
         if not can_scrape(user_id):
-            await update.message.reply_text("Please wait a minute before requesting resources.")
+            await update.message.reply_text("Please wait 30 seconds before requesting resources.")
             return
 
         global temp_resources
         temp_resources = []
-        await run_spider(ResourcesSpider)
+        urls = [
+            "https://www.freecodecamp.org/learn/",
+            "https://www.coursera.org/courses?query=open%20source",
+            "https://www.edx.org/search?q=open%20source"
+        ]
+        for url in urls:
+            content = await fetch_web_content(url)
+            if content:
+                lines = content.split('\n')
+                for line in lines[:5]:
+                    if any(kw in line.lower() for kw in ['course', 'tutorial', 'learn']):
+                        platform = url.split('/')[2].replace('www.', '')
+                        temp_resources.append({"title": line.strip(), "platform": platform, "link": url})
+
+        # Add Wikipedia summary if keyword provided
+        wiki_summary = ""
+        if keyword:
+            page = wiki.page(keyword)
+            if page.exists():
+                wiki_summary = page.summary[:200] + "..." if len(page.summary) > 200 else page.summary
 
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
         try:
@@ -523,13 +265,18 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
 
         if temp_resources:
-            response = "Open-Source Learning Resources:\n"
+            response = f"Open-Source Learning Resources{f' for {keyword}' if keyword else ''}:\n"
             filtered_resources = temp_resources
             if keyword or (profile and profile[0]):
                 filter_terms = [keyword] if keyword else profile[0].split(',')
-                filtered_resources = [r for r in temp_resources if any(term in r['title'].lower() for term in filter_terms)]
+                filtered_resources = [
+                    r for r in temp_resources
+                    if any(fuzz.partial_ratio(term.lower(), r['title'].lower()) > 70 for term in filter_terms)
+                ]
             for resource in filtered_resources[:5]:
                 response += f"- {resource['title']} ({resource['platform']}): {resource['link']}\n"
+            if wiki_summary:
+                response += f"\nWikipedia Summary for {keyword}:\n{wiki_summary}"
         else:
             response = "Unable to fetch resources. Using mock data:\n"
             for resource in MOCK_RESOURCES:
@@ -545,12 +292,21 @@ async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
         language = args[0].lower() if args else None
         if not can_scrape(user_id):
-            await update.message.reply_text("Please wait a minute before requesting trending repositories.")
+            await update.message.reply_text("Please wait 30 seconds before requesting trending repositories.")
             return
 
         global temp_trending
         temp_trending = []
-        await run_spider(TrendingSpider, language=language)
+        url = f"https://github.com/trending/{language}" if language else "https://github.com/trending"
+        content = await fetch_web_content(url)
+        if content:
+            lines = content.split('\n')
+            for line in lines[:5]:
+                if 'stars' in line.lower() or 'repository' in line.lower():
+                    temp_trending.append({
+                        "repo": line.strip(), "description": "No description",
+                        "language": language or "Unknown", "stars": "N/A"
+                    })
 
         if temp_trending:
             response = f"GitHub Trending Repositories ({language or 'All'}):\n"
@@ -571,12 +327,21 @@ async def stackoverflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
         tag = args[0].lower() if args else None
         if not can_scrape(user_id):
-            await update.message.reply_text("Please wait a minute before requesting Stack Overflow questions.")
+            await update.message.reply_text("Please wait 30 seconds before requesting Stack Overflow questions.")
             return
 
         global temp_stackoverflow
         temp_stackoverflow = []
-        await run_spider(StackOverflowSpider, tag=tag)
+        url = f"https://stackoverflow.com/questions/tagged/{tag}" if tag else "https://stackoverflow.com/questions"
+        content = await fetch_web_content(url)
+        if content:
+            lines = content.split('\n')
+            for line in lines[:5]:
+                if any(kw in line.lower() for kw in ['question', 'tagged']):
+                    temp_stackoverflow.append({
+                        "title": line.strip(), "tags": tag or "general",
+                        "link": f"https://stackoverflow.com/questions"
+                    })
 
         if temp_stackoverflow:
             response = f"Stack Overflow Questions ({tag or 'Recent'}):\n"
@@ -597,12 +362,28 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args
         keyword = args[0].lower() if args else None
         if not can_scrape(user_id):
-            await update.message.reply_text("Please wait a minute before requesting jobs.")
+            await update.message.reply_text("Please wait 30 seconds before requesting jobs.")
             return
 
         global temp_jobs
         temp_jobs = []
-        await run_spider(JobsSpider)
+        urls = [
+            "https://www.internshala.com/internships",
+            "https://www.bdjobs.com/",
+            "https://www.linkedin.com/jobs/search/?keywords=internship&location=Bangladesh",
+            "https://weworkremotely.com/"
+        ]
+        for url in urls:
+            content = await fetch_web_content(url)
+            if content:
+                lines = content.split('\n')
+                for line in lines[:5]:
+                    if any(kw in line.lower() for kw in ['job', 'internship', 'career']):
+                        company = url.split('/')[2].replace('www.', '')
+                        temp_jobs.append({
+                            "title": line.strip(), "company": company,
+                            "location": "N/A", "link": url
+                        })
 
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
         try:
@@ -617,7 +398,10 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filtered_jobs = temp_jobs
             if keyword or (profile and profile[1]):
                 filter_terms = [keyword, "bangladesh", "uiu"] if keyword else profile[1].split(',') + ["bangladesh", "uiu"]
-                filtered_jobs = [j for j in temp_jobs if any(term in j['title'].lower() or term in j['company'].lower() or term in j['location'].lower() for term in filter_terms)]
+                filtered_jobs = [
+                    j for j in temp_jobs
+                    if any(fuzz.partial_ratio(term.lower(), j['title'].lower()) > 70 for term in filter_terms)
+                ]
             for job in filtered_jobs[:5]:
                 response += f"- {job['title']} at {job['company']} ({job['location']}): {job['link']}\n"
             keyboard = [[InlineKeyboardButton("Add Job Reminder", callback_data='add_reminder_job')]]
@@ -643,38 +427,56 @@ async def roadmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
         level = args[1].lower() if len(args) > 1 and args[1].lower() in ['beginner', 'intermediate', 'advanced'] else None
 
         if not can_scrape(user_id):
-            await update.message.reply_text("Please wait a minute before requesting another roadmap.")
+            await update.message.reply_text("Please wait 30 seconds before requesting another roadmap.")
             return
 
+        # Fetch roadmap from roadmap.sh
+        content = await fetch_web_content(f"https://roadmap.sh/{roadmap_type}")
+        steps, resources, projects = [], [], []
+        if content:
+            lines = content.split('\n')
+            for line in lines:
+                if any(kw in line.lower() for kw in ['step', 'task']):
+                    steps.append(line.strip())
+                elif any(kw in line.lower() for kw in ['resource', 'tutorial', 'course']):
+                    resources.append(line.strip())
+                elif any(kw in line.lower() for kw in ['project', 'example']):
+                    projects.append(line.strip())
+
+        # Add Wikipedia summary
+        wiki_summary = ""
+        page = wiki.page(roadmap_type)
+        if page.exists():
+            wiki_summary = page.summary[:200] + "..." if len(page.summary) > 200 else page.summary
+
+        # Save to database
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
         try:
             c = conn.cursor()
-            query = "SELECT title, steps, resources, projects, last_updated FROM roadmaps WHERE roadmap_type = ?"
-            params = [roadmap_type]
-            if level:
-                query += " AND level = ?"
-                params.append(level)
-            c.execute(query, params)
-            roadmaps = c.fetchall()
-
-            if not roadmaps or (roadmaps and time.time() - roadmaps[0][4] > 24*3600):
-                global temp_roadmaps
-                temp_roadmaps = []
-                await run_spider(RoadmapSpider, roadmap_type=roadmap_type)
-                c.execute(query, params)
-                roadmaps = c.fetchall()
+            title = f"{level.capitalize() if level else 'General'} {roadmap_type.capitalize()} Roadmap"
+            c.execute(
+                "INSERT OR REPLACE INTO roadmaps (roadmap_type, level, title, steps, resources, projects, last_updated) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (roadmap_type, level or 'general', title, json.dumps(steps or ["Step not found"]),
+                 json.dumps(resources or ["Resource not found"]), json.dumps(projects or ["Project not found"]), time.time())
+            )
+            conn.commit()
+            c.execute("SELECT title, steps, resources, projects FROM roadmaps WHERE roadmap_type = ? AND level = ?",
+                      (roadmap_type, level or 'general'))
+            roadmap = c.fetchone()
         finally:
             conn.close()
 
-        if roadmaps:
-            response = ""
-            for title, steps, resources, projects, _ in roadmaps:
-                steps = json.loads(steps)
-                resources = json.loads(resources)
-                projects = json.loads(projects)
-                response += f"{title}:\n\nSteps:\n" + "\n".join(f"- {step}" for step in steps) + \
-                            f"\n\nResources:\n" + "\n".join(f"- {res}" for res in resources) + \
-                            f"\n\nProjects:\n" + "\n".join(f"- {proj}" for proj in projects) + "\n\n"
+        if roadmap:
+            title, steps, resources, projects = roadmap
+            steps = json.loads(steps)
+            resources = json.loads(resources)
+            projects = json.loads(projects)
+            response = f"{title}:\n\nSteps:\n" + "\n".join(f"- {step}" for step in steps) + \
+                       f"\n\nResources:\n" + "\n".join(f"- {res}" for res in resources) + \
+                       f"\n\nProjects:\n" + "\n".join(f"- {proj}" for proj in projects)
+            if wiki_summary:
+                response += f"\n\nWikipedia Summary for {roadmap_type}:\n{wiki_summary}"
             keyboard = [
                 [InlineKeyboardButton("Beginner", callback_data=f'roadmap_{roadmap_type}_beginner'),
                  InlineKeyboardButton("Intermediate", callback_data=f'roadmap_{roadmap_type}_intermediate'),
@@ -704,17 +506,39 @@ async def mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = args[1].lower()
 
         if not can_scrape(user_id):
-            await update.message.reply_text("Please wait a minute before requesting another mentor search.")
+            await update.message.reply_text("Please wait 30 seconds before requesting another mentor search.")
             return
 
-        global temp_faculty, temp_faculty_urls
-        temp_faculty.clear()
-        temp_faculty_urls.clear()
-        await run_spider(FacultySpider)
+        global temp_faculty
+        temp_faculty = []
+        urls = [
+            "https://cse.uiu.ac.bd/faculty-members/",
+            "https://eee.uiu.ac.bd/faculty/",
+            "https://ce.uiu.ac.bd/faculty-members/",
+            "https://sobe.uiu.ac.bd/bba-faculty/",
+            "https://pharmacy.uiu.ac.bd/faculty-members/",
+            "https://ins.uiu.ac.bd/faculty-members/",
+            "https://www.uiu.ac.bd/faculty-members/"
+        ]
+        for url in urls:
+            content = await fetch_web_content(url)
+            if content:
+                lines = content.split('\n')
+                for line in lines:
+                    if any(kw in line.lower() for kw in ['professor', 'lecturer', 'dr.']):
+                        department = url.split('/')[2].replace('www.', '').split('.')[0].upper()
+                        temp_faculty.append({
+                            "name": line.strip(), "designation": "N/A", "department": department,
+                            "email": "N/A", "phone": "N/A", "expertise": query
+                        })
 
         if temp_faculty:
             response = f"Mentors for '{query}':\n"
-            filtered_faculty = [f for f in temp_faculty if query in f['department'].lower() or query in f['expertise'].lower()]
+            filtered_faculty = [
+                f for f in temp_faculty
+                if fuzz.partial_ratio(query.lower(), f['department'].lower()) > 70 or
+                   fuzz.partial_ratio(query.lower(), f['expertise'].lower()) > 70
+            ]
             if filtered_faculty:
                 for f in filtered_faculty:
                     response += f"- {f['name']} ({f['designation']}, {f['department']})\n  Email: {f['email']}\n  Phone: {f['phone']}\n  Expertise: {f['expertise']}\n"
@@ -724,13 +548,13 @@ async def mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 response = f"No mentors found for '{query}'. Using mock data:\n"
                 for f in MOCK_FACULTY:
-                    if query in f['department'].lower() or query in f['expertise'].lower():
+                    if fuzz.partial_ratio(query.lower(), f['department'].lower()) > 70 or fuzz.partial_ratio(query.lower(), f['expertise'].lower()) > 70:
                         response += f"- {f['name']} ({f['designation']}, {f['department']})\n  Email: {f['email']}\n  Phone: {f['phone']}\n  Expertise: {f['expertise']}\n"
                 reply_markup = None
         else:
             response = f"No mentors found for '{query}'. Using mock data:\n"
             for f in MOCK_FACULTY:
-                if query in f['department'].lower() or query in f['expertise'].lower():
+                if fuzz.partial_ratio(query.lower(), f['department'].lower()) > 70 or fuzz.partial_ratio(query.lower(), f['expertise'].lower()) > 70:
                     response += f"- {f['name']} ({f['designation']}, {f['department']})\n  Email: {f['email']}\n  Phone: {f['phone']}\n  Expertise: {f['expertise']}\n"
             reply_markup = None
 
@@ -743,12 +567,17 @@ async def notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = update.effective_user.id
         if not can_scrape(user_id):
-            await update.message.reply_text("Please wait a minute before requesting notices.")
+            await update.message.reply_text("Please wait 30 seconds before requesting notices.")
             return
 
         global temp_notices
         temp_notices = []
-        await run_spider(NoticeSpider)
+        content = await fetch_web_content("https://www.uiu.ac.bd")
+        if content:
+            lines = content.split('\n')
+            for i, line in enumerate(lines[:3], 1):
+                if any(kw in line.lower() for kw in ['notice', 'announcement', 'update']):
+                    temp_notices.append({"title": line.strip(), "date": "N/A", "details": line.strip()})
 
         if temp_notices:
             response = "Latest UIU Notices:\n"
@@ -762,30 +591,6 @@ async def notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in notice command: {e}")
         await update.message.reply_text("Error fetching notices. Please try again.")
-
-async def collab(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        args = context.args
-        if not args or args[0].lower() != "post":
-            await update.message.reply_text("Usage: /collab post 'Your message'")
-            return
-        post = " ".join(args[1:])
-        await update.message.reply_text(f"Collaboration post created: {post}\nComing soon: Team matching feature.")
-    except Exception as e:
-        logger.error(f"Error in collab command: {e}")
-        await update.message.reply_text("Error posting collaboration request. Please try again.")
-
-async def events(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        keyboard = [[InlineKeyboardButton("Mark Attendance", callback_data='mark_attendance')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        response = "Upcoming UIU Events:\n"
-        for event in MOCK_EVENTS:
-            response += f"- {event['name']} ({event['date']}): {event['details']}\n"
-        await update.message.reply_text(response, reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"Error in events command: {e}")
-        await update.message.reply_text("Error fetching events. Please try again.")
 
 async def links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -801,27 +606,6 @@ async def links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in links command: {e}")
         await update.message.reply_text("Error fetching links. Please try again.")
 
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("Coming soon: Developer Recognition Leaderboard.")
-    except Exception as e:
-        logger.error(f"Error in leaderboard command: {e}")
-        await update.message.reply_text("Error fetching leaderboard. Please try again.")
-
-async def meetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("Coming soon: UIU student-organized tech meetups and coding jams.")
-    except Exception as e:
-        logger.error(f"Error in meetup command: {e}")
-        await update.message.reply_text("Error fetching meetups. Please try again.")
-
-async def internship(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("Use /jobs to find internships and job opportunities.")
-    except Exception as e:
-        logger.error(f"Error in internship command: {e}")
-        await update.message.reply_text("Error fetching internships. Please try again.")
-
 async def cgpa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
@@ -832,31 +616,16 @@ async def cgpa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         grades = {course.split(':')[0]: course.split(':')[1] for course in args}
         grade_points = {'A': 4.0, 'A-': 3.7, 'B+': 3.3, 'B': 3.0, 'B-': 2.7, 'C+': 2.3, 'C': 2.0}
-        df = pd.DataFrame(list(grades.items()), columns=['Course', 'Grade'])
-        df['Points'] = df['Grade'].map(grade_points)
-        if df['Points'].isna().any():
+        df = pl.DataFrame({"Course": list(grades.keys()), "Grade": list(grades.values())})
+        df = df.with_columns(pl.col("Grade").map_dict(grade_points, default=None).alias("Points"))
+        if df["Points"].is_null().any():
             await update.message.reply_text("Invalid grade(s). Use: A, A-, B+, B, B-, C+, C")
             return
-        cgpa = df['Points'].mean()
-        await update.message.reply_text(f"Your CGPA: {cgpa:.2f}\n{df.to_string(index=False)}")
+        cgpa = df["Points"].mean()
+        await update.message.reply_text(f"Your CGPA: {cgpa:.2f}\n{df.select(['Course', 'Grade', 'Points']).to_string()}")
     except Exception as e:
         logger.error(f"Error in cgpa command: {e}")
         await update.message.reply_text("Invalid format. Use: /cgpa cse321:A cse322:B+")
-
-async def gpapredict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        args = context.args
-        if len(args) != 2:
-            await update.message.reply_text("Usage: /gpapredict current_cgpa target_cgpa\nExample: /gpapredict 3.5 3.8")
-            return
-        current_cgpa, target_cgpa = float(args[0]), float(args[1])
-        response = f"To achieve a target CGPA of {target_cgpa:.2f} from {current_cgpa:.2f}, aim for high grades in remaining courses. Detailed prediction coming soon."
-        await update.message.reply_text(response)
-    except ValueError:
-        await update.message.reply_text("Please provide valid CGPA values, e.g., /gpapredict 3.5 3.8")
-    except Exception as e:
-        logger.error(f"Error in gpapredict command: {e}")
-        await update.message.reply_text("Error predicting CGPA. Please try again.")
 
 async def scholarships(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -868,42 +637,24 @@ async def scholarships(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in scholarships command: {e}")
         await update.message.reply_text("Error fetching scholarships. Please try again.")
 
-async def academic_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await calendar(update, context)
-
-async def career(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("Coming soon: Career Office updates, CV workshops, and recruitment drives.")
-    except Exception as e:
-        logger.error(f"Error in career command: {e}")
-        await update.message.reply_text("Error fetching career updates. Please try again.")
-
-async def fyp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        args = context.args
-        if not args or args[0].lower() not in ["ideas", "docs"]:
-            await update.message.reply_text("Usage: /fyp ideas or /fyp docs")
-            return
-        if args[0].lower() == "ideas":
-            await update.message.reply_text("Coming soon: Trending FYP ideas from UIU alumni.")
-        elif args[0].lower() == "docs":
-            await update.message.reply_text("Coming soon: FYP guidelines, formats, and past submissions.")
-    except Exception as e:
-        logger.error(f"Error in fyp command: {e}")
-        await update.message.reply_text("Error fetching FYP info. Please try again.")
-
 async def studyplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         if len(args) < 4:
             await update.message.reply_text("Usage: /studyplan course1,course2 hours_per_week target_date(YYYY-MM-DD) priority(course1:1,cse322:2)")
             return
-        courses, hours, target_date, priority = args[0].split(','), int(args[1]), args[2], args[3]
-        plan = StudyPlan(courses=courses, hours_per_week=hours, target_date=target_date, priority=priority)
+        courses, hours, target_date, priority = args[0].split(','), float(args[1]), args[2], args[3]
+        try:
+            datetime.strptime(target_date, '%Y-%m-%d')
+        except ValueError:
+            await update.message.reply_text("Invalid date format. Use YYYY-MM-DD, e.g., 2025-09-01")
+            return
         priorities = {p.split(':')[0]: int(p.split(':')[1]) for p in priority.split(',')}
-        df = pd.DataFrame(plan.courses, columns=['Course'])
-        df['Priority'] = df['Course'].map(priorities)
-        df['Hours'] = df['Priority'].apply(lambda x: (plan.hours_per_week * (3 - x)) / len(plan.courses))
+        df = pl.DataFrame({"Course": courses})
+        df = df.with_columns(
+            Priority=pl.col("Course").map_dict(priorities, default=1),
+            Hours=pl.col("Course").map_elements(lambda x: (hours * (3 - priorities.get(x, 1))) / len(courses))
+        )
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
         try:
             c = conn.cursor()
@@ -912,10 +663,8 @@ async def studyplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
         finally:
             conn.close()
-        response = f"Study Plan for {plan.target_date}:\n{df.to_string(index=False)}\nTotal Hours/Week: {plan.hours_per_week}"
+        response = f"Study Plan for {target_date}:\n{df.to_string()}\nTotal Hours/Week: {hours}"
         await update.message.reply_text(response)
-    except ValidationError as e:
-        await update.message.reply_text(f"Invalid input: {e}")
     except Exception as e:
         logger.error(f"Error in studyplan command: {e}")
         await update.message.reply_text("Error creating study plan. Please try again.")
@@ -924,7 +673,7 @@ async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         if not args:
-            await update.message.reply_text("Usage: /reminders add task deadline(YYYY-MM-DD) [recurrence] or /reminders list")
+            await update.message.reply_text("Usage: /reminders add task deadline(YYYY-MM-DD) or /reminders list")
             return
         user_id = update.effective_user.id
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
@@ -932,45 +681,25 @@ async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c = conn.cursor()
             if args[0].lower() == "add":
                 task, deadline = " ".join(args[1:-1]), args[-1]
-                recurrence = args[-1] if len(args) > 2 and args[-2] in ['daily', 'weekly'] else 'none'
-                if recurrence != 'none':
-                    deadline = args[-2]
                 try:
                     datetime.strptime(deadline, '%Y-%m-%d')
                 except ValueError:
                     await update.message.reply_text("Invalid date format. Use YYYY-MM-DD, e.g., 2025-09-01")
                     return
-                c.execute("INSERT INTO reminders (user_id, task, deadline, recurrence) VALUES (?, ?, ?, ?)",
-                          (user_id, task, deadline, recurrence))
+                c.execute("INSERT INTO reminders (user_id, task, deadline) VALUES (?, ?, ?)",
+                          (user_id, task, deadline))
                 conn.commit()
-                scheduler = AsyncIOScheduler()
-                if recurrence == 'daily':
-                    scheduler.add_job(send_reminder, 'interval', days=1, start_date=datetime.strptime(deadline, '%Y-%m-%d'),
-                                     args=[context.bot, user_id, task])
-                elif recurrence == 'weekly':
-                    scheduler.add_job(send_reminder, 'interval', weeks=1, start_date=datetime.strptime(deadline, '%Y-%m-%d'),
-                                     args=[context.bot, user_id, task])
-                else:
-                    scheduler.add_job(send_reminder, 'date', run_date=datetime.strptime(deadline, '%Y-%m-%d'),
-                                     args=[context.bot, user_id, task])
-                scheduler.start()
-                await update.message.reply_text(f"Reminder set: {task} on {deadline} ({recurrence})")
+                await update.message.reply_text(f"Reminder set: {task} on {deadline}")
             else:
-                c.execute("SELECT task, deadline, recurrence FROM reminders WHERE user_id = ?", (user_id,))
+                c.execute("SELECT task, deadline FROM reminders WHERE user_id = ?", (user_id,))
                 reminders = c.fetchall()
-                response = "Your Reminders:\n" + "\n".join(f"- {task} ({deadline}, {recurrence})" for task, deadline, recurrence in reminders)
+                response = "Your Reminders:\n" + "\n".join(f"- {task} ({deadline})" for task, deadline in reminders)
                 await update.message.reply_text(response or "No reminders set.")
         finally:
             conn.close()
     except Exception as e:
         logger.error(f"Error in reminders command: {e}")
         await update.message.reply_text("Error setting/listing reminders. Please try again.")
-
-async def send_reminder(bot, user_id, task):
-    try:
-        await bot.send_message(user_id, f"Reminder: {task} is due today!")
-    except Exception as e:
-        logger.error(f"Error sending reminder: {e}")
 
 async def motivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1038,18 +767,16 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not args or args[0].lower() != "set" or len(args) < 4:
             await update.message.reply_text("Usage: /profile set department year favorite_roadmaps\nExample: /profile set CSE 2 python,javascript")
             return
-        profile = UserProfile(department=args[1], year=int(args[2]), favorite_roadmaps=args[3])
+        department, year, favorite_roadmaps = args[1], int(args[2]), args[3]
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
         try:
             c = conn.cursor()
             c.execute("INSERT OR REPLACE INTO user_profiles (user_id, department, year, favorite_roadmaps) VALUES (?, ?, ?, ?)",
-                      (user_id, profile.department, profile.year, profile.favorite_roadmaps))
+                      (user_id, department, year, favorite_roadmaps))
             conn.commit()
         finally:
             conn.close()
-        await update.message.reply_text(f"Profile updated: {profile.department}, Year {profile.year}, Roadmaps: {profile.favorite_roadmaps}")
-    except ValidationError as e:
-        await update.message.reply_text(f"Invalid input: {e}")
+        await update.message.reply_text(f"Profile updated: {department}, Year {year}, Roadmaps: {favorite_roadmaps}")
     except Exception as e:
         logger.error(f"Error in profile command: {e}")
         await update.message.reply_text("Error setting profile. Please try again.")
@@ -1094,27 +821,40 @@ async def recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
             roadmaps, dept = profile[1], profile[0]
             response += f"For {roadmaps.split(',')[0]} and {dept}:\n"
             if temp_resources:
-                filtered_resources = [r for r in temp_resources if any(term in r['title'].lower() for term in roadmaps.split(','))]
+                filtered_resources = [
+                    r for r in temp_resources
+                    if any(fuzz.partial_ratio(term.lower(), r['title'].lower()) > 70 for term in roadmaps.split(','))
+                ]
                 for resource in filtered_resources[:3]:
                     response += f"- Resource: {resource['title']} ({resource['platform']}): {resource['link']}\n"
             if temp_trending:
-                filtered_trending = [r for r in temp_trending if any(term in r['language'].lower() for term in roadmaps.split(','))]
+                filtered_trending = [
+                    r for r in temp_trending
+                    if any(fuzz.partial_ratio(term.lower(), r['language'].lower()) > 70 for term in roadmaps.split(','))
+                ]
                 for repo in filtered_trending[:3]:
                     response += f"- Repo: {repo['repo']} ({repo['language']}): {repo['description']}\n"
             if temp_jobs:
-                filtered_jobs = [j for j in temp_jobs if any(term in j['title'].lower() or term in j['company'].lower() for term in roadmaps.split(','))]
+                filtered_jobs = [
+                    j for j in temp_jobs
+                    if any(fuzz.partial_ratio(term.lower(), j['title'].lower()) > 70 for term in roadmaps.split(','))
+                ]
                 for job in filtered_jobs[:3]:
                     response += f"- Job: {job['title']} at {job['company']} ({job['location']}): {job['link']}\n"
-            global temp_faculty, temp_faculty_urls
-            temp_faculty.clear()
-            temp_faculty_urls.clear()
-            await run_spider(FacultySpider)
             if temp_faculty:
-                filtered_faculty = [f for f in temp_faculty if dept.lower() in f['department'].lower() or roadmaps.split(',')[0] in f['expertise'].lower()]
+                filtered_faculty = [
+                    f for f in temp_faculty
+                    if fuzz.partial_ratio(dept.lower(), f['department'].lower()) > 70 or
+                       any(fuzz.partial_ratio(term.lower(), f['expertise'].lower()) > 70 for term in roadmaps.split(','))
+                ]
                 if filtered_faculty:
                     response += "Suggested Mentors:\n" + "\n".join(f"- {f['name']} ({f['email']})" for f in filtered_faculty[:3])
             else:
-                response += "Suggested Mentors:\n" + "\n".join(f"- {f['name']} ({f['email']})" for f in MOCK_FACULTY if dept.lower() in f['department'].lower() or roadmaps.split(',')[0] in f['expertise'].lower())
+                response += "Suggested Mentors:\n" + "\n".join(
+                    f"- {f['name']} ({f['email']})" for f in MOCK_FACULTY
+                    if fuzz.partial_ratio(dept.lower(), f['department'].lower()) > 70 or
+                       any(fuzz.partial_ratio(term.lower(), f['expertise'].lower()) > 70 for term in roadmaps.split(','))
+                )
         else:
             response += "Set your profile with /profile to get personalized recommendations."
         await update.message.reply_text(response)
@@ -1175,10 +915,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("No profile set. Use /profile set dept year roadmaps")
         elif query.data == 'set_profile':
             await query.message.reply_text("Set your profile with /profile set department year favorite_roadmaps\nExample: /profile set CSE 2 python,javascript")
-        elif query.data == 'mark_attendance':
-            await query.message.reply_text("Coming soon: Event attendance marking feature.")
         elif query.data == 'add_reminder_calendar':
-            await query.message.reply_text("To add a calendar event reminder, use /reminders add 'Event Name' YYYY-MM-DD [recurrence]")
+            await query.message.reply_text("To add a calendar event reminder, use /reminders add 'Event Name' YYYY-MM-DD")
         elif query.data == 'add_reminder_job':
             await query.message.reply_text("To add a job application reminder, use /reminders add 'Apply for Job Title' YYYY-MM-DD")
         elif query.data == 'help':
@@ -1191,6 +929,48 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
     if update and update.message:
         await update.message.reply_text("An error occurred. Please try again.")
+
+# Streamlit dashboard
+def run_streamlit():
+    st.set_page_config(page_title="UIU Developer Hub Dashboard", page_icon="🎓")
+    st.title("UIU Developer Hub Dashboard")
+    st.header("User Profile and Progress")
+
+    conn = sqlite3.connect('uiu_bot.db', timeout=10)
+    try:
+        # User Profiles
+        profiles = pl.read_database("SELECT * FROM user_profiles", conn)
+        if not profiles.is_empty():
+            st.subheader("User Profiles")
+            st.dataframe(profiles)
+        else:
+            st.write("No user profiles found.")
+
+        # Study Plans (Progress)
+        progress = pl.read_database("SELECT * FROM progress", conn)
+        if not progress.is_empty():
+            st.subheader("Study Plan Progress")
+            st.dataframe(progress)
+        else:
+            st.write("No study plan progress found.")
+
+        # Reminders
+        reminders = pl.read_database("SELECT * FROM reminders", conn)
+        if not reminders.is_empty():
+            st.subheader("Reminders")
+            st.dataframe(reminders)
+        else:
+            st.write("No reminders set.")
+
+        # Code Snippets
+        snippets = pl.read_database("SELECT * FROM code_snippets", conn)
+        if not snippets.is_empty():
+            st.subheader("Code Snippets")
+            st.dataframe(snippets)
+        else:
+            st.write("No code snippets found.")
+    finally:
+        conn.close()
 
 # Webhook handler
 async def webhook_handler(request: web.Request) -> web.Response:
@@ -1211,70 +991,55 @@ async def health_check(request: web.Request) -> web.Response:
 # Setup Telegram application and webhook
 async def setup_application():
     global application
-    retries = 3
-    for attempt in range(retries):
-        try:
-            if not BOT_TOKEN:
-                logger.error("BOT_TOKEN environment variable not set")
-                raise ValueError("BOT_TOKEN not set")
+    try:
+        if not BOT_TOKEN:
+            logger.error("BOT_TOKEN environment variable not set")
+            raise ValueError("BOT_TOKEN not set")
 
-            application = Application.builder().token(BOT_TOKEN).build()
+        application = Application.builder().token(BOT_TOKEN).build()
 
-            # Add handlers
-            application.add_handler(CommandHandler("start", start))
-            application.add_handler(CommandHandler("help", help))
-            application.add_handler(CommandHandler("calendar", calendar))
-            application.add_handler(CommandHandler("resources", resources))
-            application.add_handler(CommandHandler("trending", trending))
-            application.add_handler(CommandHandler("stackoverflow", stackoverflow))
-            application.add_handler(CommandHandler("jobs", jobs))
-            application.add_handler(CommandHandler("roadmap", roadmap))
-            application.add_handler(CommandHandler("mentor", mentor))
-            application.add_handler(CommandHandler("notice", notice))
-            application.add_handler(CommandHandler("collab", collab))
-            application.add_handler(CommandHandler("events", events))
-            application.add_handler(CommandHandler("links", links))
-            application.add_handler(CommandHandler("leaderboard", leaderboard))
-            application.add_handler(CommandHandler("meetup", meetup))
-            application.add_handler(CommandHandler("internship", internship))
-            application.add_handler(CommandHandler("cgpa", cgpa))
-            application.add_handler(CommandHandler("gpapredict", gpapredict))
-            application.add_handler(CommandHandler("scholarships", scholarships))
-            application.add_handler(CommandHandler("academic", academic_calendar))
-            application.add_handler(CommandHandler("career", career))
-            application.add_handler(CommandHandler("fyp", fyp))
-            application.add_handler(CommandHandler("studyplan", studyplan))
-            application.add_handler(CommandHandler("reminders", reminders))
-            application.add_handler(CommandHandler("motivate", motivate))
-            application.add_handler(CommandHandler("codeshare", codeshare))
-            application.add_handler(CommandHandler("profile", profile))
-            application.add_handler(CommandHandler("progress", progress))
-            application.add_handler(CommandHandler("recommend", recommend))
-            application.add_handler(CallbackQueryHandler(button_callback))
-            application.add_error_handler(error_handler)
+        # Add handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help))
+        application.add_handler(CommandHandler("calendar", calendar))
+        application.add_handler(CommandHandler("resources", resources))
+        application.add_handler(CommandHandler("trending", trending))
+        application.add_handler(CommandHandler("stackoverflow", stackoverflow))
+        application.add_handler(CommandHandler("jobs", jobs))
+        application.add_handler(CommandHandler("roadmap", roadmap))
+        application.add_handler(CommandHandler("mentor", mentor))
+        application.add_handler(CommandHandler("notice", notice))
+        application.add_handler(CommandHandler("links", links))
+        application.add_handler(CommandHandler("cgpa", cgpa))
+        application.add_handler(CommandHandler("scholarships", scholarships))
+        application.add_handler(CommandHandler("studyplan", studyplan))
+        application.add_handler(CommandHandler("reminders", reminders))
+        application.add_handler(CommandHandler("motivate", motivate))
+        application.add_handler(CommandHandler("codeshare", codeshare))
+        application.add_handler(CommandHandler("profile", profile))
+        application.add_handler(CommandHandler("progress", progress))
+        application.add_handler(CommandHandler("recommend", recommend))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        application.add_error_handler(error_handler)
 
-            await application.initialize()
-            await application.start()
+        await application.initialize()
+        await application.start()
 
-            webhook_info = await application.bot.get_webhook_info()
-            if webhook_info.url != WEBHOOK_URL:
-                await application.bot.delete_webhook(drop_pending_updates=True)
-                await application.bot.set_webhook(url=WEBHOOK_URL)
-                logger.info(f"Webhook set to {WEBHOOK_URL}")
-            else:
-                logger.info(f"Webhook already set to {WEBHOOK_URL}")
-            return
-        except Exception as e:
-            logger.error(f"Setup attempt {attempt + 1} failed: {e}")
-            if attempt < retries - 1:
-                await asyncio.sleep(2)
-            else:
-                raise
+        webhook_info = await application.bot.get_webhook_info()
+        if webhook_info.url != WEBHOOK_URL:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            await application.bot.set_webhook(url=WEBHOOK_URL)
+            logger.info(f"Webhook set to {WEBHOOK_URL}")
+        else:
+            logger.info(f"Webhook already set to {WEBHOOK_URL}")
+    except Exception as e:
+        logger.error(f"Setup failed: {e}")
+        raise
 
-# Main function to run webhook server
+# Main function to run both Telegram bot and Streamlit
 async def main():
     try:
-        # Create aiohttp app
+        # Create aiohttp app for Telegram webhook
         app = web.Application()
         app.router.add_post('/webhook', webhook_handler)
         app.router.add_get('/', health_check)
@@ -1289,6 +1054,10 @@ async def main():
         await site.start()
         logger.info(f"Webhook server running on port {PORT}")
 
+        # Start Streamlit in a separate process
+        import subprocess
+        subprocess.Popen(["streamlit", "run", __file__, "--server.port", str(STREAMLIT_PORT)])
+
         # Keep the application running
         while True:
             await asyncio.sleep(3600)
@@ -1297,4 +1066,7 @@ async def main():
         raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if "streamlit" in os.environ.get("PYTHONPATH", ""):
+        run_streamlit()
+    else:
+        asyncio.run(main())
