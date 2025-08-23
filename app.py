@@ -16,8 +16,6 @@ from rapidfuzz import fuzz
 import streamlit as st
 import wikipediaapi
 import wikipedia
-from instagrapi import Client
-import praw
 from aiohttp import web
 from typing import List, Dict
 
@@ -34,11 +32,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://uiu-buddy-bot.onrender.com/webhook")
 PORT = int(os.getenv("PORT", 8443))
 STREAMLIT_PORT = int(os.getenv("STREAMLIT_PORT", 8501))
-REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
-REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "UIUBuddyBot/1.0")
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
-INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
 
 # Initialize SQLite database
 def init_db():
@@ -62,7 +55,8 @@ def init_db():
             (1001, "Data Structures and Algorithms", "Mirpur"),
             (1002, "Data Structures and Algorithms", "Dhanmondi"),
             (1003, "Operating Systems", "Banani"),
-            (1004, "Python Programming", "Gulshan")
+            (1004, "Python Programming", "Gulshan"),
+            (1005, "CSE321", "Uttara")
         ]
         c.executemany("INSERT OR IGNORE INTO peer_matches (user_id, course, location) VALUES (?, ?, ?)", mock_peers)
         conn.commit()
@@ -81,22 +75,6 @@ init_db()
 wiki_api = wikipediaapi.Wikipedia('UIUBuddyBot/1.0 (https://uiu.ac.bd)', 'en')
 wikipedia.set_lang("en")
 
-# Initialize Reddit (PRAW)
-reddit = praw.Reddit(
-    client_id=REDDIT_CLIENT_ID,
-    client_secret=REDDIT_CLIENT_SECRET,
-    user_agent=REDDIT_USER_AGENT
-)
-
-# Initialize Instagram (instagrapi)
-insta_client = Client()
-if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
-    try:
-        insta_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-        logger.info("Instagram login successful")
-    except Exception as e:
-        logger.error(f"Instagram login failed: {e}")
-
 # Temporary in-memory storage
 temp_calendar: List[Dict] = []
 
@@ -105,6 +83,11 @@ MOCK_EVENTS = [
     {"name": "UIU Hackathon 2025", "date": "2025-09-15", "details": "Join the annual coding challenge!"},
     {"name": "Midterm Exams", "date": "2025-10-10", "details": "Prepare for your midterm exams."}
 ]
+MOCK_ABOUT = (
+    "UIU Developer Hub is a student-run club at United International University focused on fostering "
+    "technical skills through workshops, hackathons, and coding competitions. It provides resources, "
+    "mentorship, and networking opportunities for students in CSE and related fields."
+)
 
 # Web scraping with Trafilatura
 async def fetch_web_content(url: str) -> str:
@@ -117,7 +100,7 @@ async def fetch_web_content(url: str) -> str:
             logger.error(f"Error fetching {url}: {e}")
             return ""
 
-# Social media scraping
+# Twitter/X scraping with snscrape
 def scrape_twitter(query: str, max_results: int = 5) -> List[Dict]:
     try:
         cmd = f"snscrape --max-results {max_results} twitter-search '{query} near:Dhaka' > twitter_results.jsonl"
@@ -130,24 +113,6 @@ def scrape_twitter(query: str, max_results: int = 5) -> List[Dict]:
         return results
     except Exception as e:
         logger.error(f"Twitter scrape error: {e}")
-        return []
-
-def scrape_reddit(query: str, max_results: int = 5) -> List[Dict]:
-    try:
-        results = []
-        for submission in reddit.subreddit("UIU+learnprogramming").search(query, limit=max_results):
-            results.append({"user": submission.author.name if submission.author else "Anonymous", "content": submission.title})
-        return results
-    except Exception as e:
-        logger.error(f"Reddit scrape error: {e}")
-        return []
-
-def scrape_instagram(hashtag: str, max_results: int = 5) -> List[Dict]:
-    try:
-        posts = insta_client.hashtag_medias_recent(hashtag, amount=max_results)
-        return [{"user": post.user.username, "content": post.caption or ""} for post in posts]
-    except Exception as e:
-        logger.error(f"Instagram scrape error: {e}")
         return []
 
 # Rate limiting
@@ -167,12 +132,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("View Profile", callback_data='view_profile'),
              InlineKeyboardButton("Set Profile", callback_data='set_profile'),
+             InlineKeyboardButton("About UIU Developer Hub", callback_data='about'),
              InlineKeyboardButton("Help", callback_data='help')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
             "Welcome to UIU Buddy Bot! 🎓\n"
-            f"Find study partners and ride shares. View your dashboard at http://localhost:{STREAMLIT_PORT}",
+            f"Find study partners, ride shares, and more. View your dashboard at http://localhost:{STREAMLIT_PORT}",
             reply_markup=reply_markup
         )
     except Exception as e:
@@ -185,28 +151,55 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📚 *UIU Buddy Bot Commands*\n\n"
             "1. **/start** - Start the bot and see welcome message.\n"
             "2. **/help** - Show this help message with all commands.\n"
-            "3. **/calendar** - View UIU academic calendar events.\n"
-            "4. **/resources [keyword]** - Find learning resources with Wikipedia summaries.\n"
+            "3. **/about** - Learn about the UIU Developer Hub.\n"
+            "4. **/calendar** - View UIU academic calendar events.\n"
+            "5. **/resources [keyword]** - Find learning resources with Wikipedia summaries.\n"
             "   Example: /resources python\n"
-            "5. **/cgpa <course:grade>** - Calculate CGPA.\n"
+            "6. **/cgpa <course:grade>** - Calculate CGPA.\n"
             "   Example: /cgpa cse321:A cse322:B+\n"
-            "6. **/studyplan <courses> <hours> <date> <priority>** - Create a study plan.\n"
+            "7. **/studyplan <courses> <hours> <date> <priority>** - Create a study plan.\n"
             "   Example: /studyplan cse321,cse322 10 2025-12-01 cse321:1,cse322:2\n"
-            "7. **/reminders add <task> <date>** - Set reminders.\n"
+            "8. **/reminders add <task> <date>** - Set reminders.\n"
             "   Example: /reminders add Meet Dr. Suman 2025-09-01\n"
-            "8. **/reminders list** - List all reminders.\n"
-            "9. **/motivate** - Get motivational tips.\n"
-            "10. **/profile set <department> <year> <roadmaps> <courses> <commute>** - Set user profile.\n"
+            "9. **/reminders list** - List all reminders.\n"
+            "10. **/motivate** - Get motivational tips.\n"
+            "11. **/profile set <department> <year> <roadmaps> <courses> <commute>** - Set user profile.\n"
             "    Example: /profile set CSE 2 python,dsa cse321,cse322 Dhanmondi\n"
-            "11. **/study find <course>** - Find peers taking a specific course.\n"
+            "12. **/study find <course>** - Find peers taking a specific course.\n"
             "    Example: /study find cse321\n"
-            "12. **/ride share <location>** - Find peers commuting to a location.\n"
+            "13. **/ride share <location>** - Find peers commuting to a location.\n"
             "    Example: /ride share Dhanmondi"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in help command: {e}")
         await update.message.reply_text("Error displaying help. Please try again.")
+
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.effective_user.id
+        if not can_scrape(user_id):
+            await update.message.reply_text("Please wait 30 seconds before requesting information again.")
+            return
+
+        content = await fetch_web_content("https://www.uiu.ac.bd/clubs/developer-hub")
+        about_text = MOCK_ABOUT
+        if content:
+            lines = content.split('\n')
+            for line in lines:
+                if any(kw in line.lower() for kw in ['developer hub', 'club', 'mission', 'vision']):
+                    about_text = line.strip()[:500] + "..." if len(line) > 500 else line.strip()
+                    break
+
+        response = (
+            "🏫 *About UIU Developer Hub*\n\n"
+            f"{about_text}\n\n"
+            "Visit https://www.uiu.ac.bd/clubs/developer-hub for more details."
+        )
+        await update.message.reply_text(response, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in about command: {e}")
+        await update.message.reply_text("Error fetching UIU Developer Hub info. Please try again.")
 
 async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -450,14 +443,8 @@ async def study_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             conn.close()
 
-        # Social media search
-        social_results = []
+        # Twitter/X search
         twitter_results = scrape_twitter(f"{course} UIU", max_results=3)
-        reddit_results = scrape_reddit(course, max_results=3)
-        insta_results = scrape_instagram(f"UIU{course.replace(' ', '')}", max_results=3)
-        social_results.extend(twitter_results)
-        social_results.extend(reddit_results)
-        social_results.extend(insta_results)
 
         # Wikipedia summary
         wiki_summary = ""
@@ -478,12 +465,12 @@ async def study_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             response += "- No peers found in database.\n"
 
-        if social_results:
-            response += "\nSocial Media Matches:\n"
-            for result in social_results[:5]:
-                response += f"- {result['user']}: {result['content'][:100]}...\n"
+        if twitter_results:
+            response += "\nTwitter/X Matches:\n"
+            for result in twitter_results[:3]:
+                response += f"- @{result['user']}: {result['content'][:100]}...\n"
         else:
-            response += "\nNo social media matches found.\n"
+            response += "\nNo Twitter/X matches found.\n"
 
         if wiki_summary:
             response += f"\nWikipedia Summary for {course}:\n{wiki_summary}"
@@ -513,14 +500,8 @@ async def ride_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             conn.close()
 
-        # Social media search
-        social_results = []
+        # Twitter/X search
         twitter_results = scrape_twitter(f"commute {location} UIU", max_results=3)
-        reddit_results = scrape_reddit(f"commute {location}", max_results=3)
-        insta_results = scrape_instagram(f"UIU{location.replace(' ', '')}", max_results=3)
-        social_results.extend(twitter_results)
-        social_results.extend(reddit_results)
-        social_results.extend(insta_results)
 
         response = f"Ride Share Partners for {location}:\n"
         if matches:
@@ -530,12 +511,12 @@ async def ride_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             response += "- No peers found in database.\n"
 
-        if social_results:
-            response += "\nSocial Media Matches:\n"
-            for result in social_results[:5]:
-                response += f"- {result['user']}: {result['content'][:100]}...\n"
+        if twitter_results:
+            response += "\nTwitter/X Matches:\n"
+            for result in twitter_results[:3]:
+                response += f"- @{result['user']}: {result['content'][:100]}...\n"
         else:
-            response += "\nNo social media matches found.\n"
+            response += "\nNo Twitter/X matches found.\n"
         await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"Error in ride share command: {e}")
@@ -566,6 +547,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         elif query.data == 'add_reminder_calendar':
             await query.message.reply_text("To add a calendar event reminder, use /reminders add 'Event Name' YYYY-MM-DD")
+        elif query.data == 'about':
+            await about(update, context)
         elif query.data == 'help':
             await help(update, context)
     except Exception as e:
@@ -643,6 +626,7 @@ async def setup_application():
 
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help))
+        application.add_handler(CommandHandler("about", about))
         application.add_handler(CommandHandler("calendar", calendar))
         application.add_handler(CommandHandler("resources", resources))
         application.add_handler(CommandHandler("cgpa", cgpa))
