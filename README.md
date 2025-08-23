@@ -29,30 +29,38 @@ Prerequisites
 
 Installation
 1. Clone the Repository:
-   git clone https://github.com/your-username/uiu-buddy-bot.git
-   cd uiu-buddy-bot
 
-2. Install Dependencies:
+       git clone https://github.com/your-username/uiu-buddy-bot.git
+
+
+       cd uiu-buddy-bot
+
+3. Install Dependencies:
    Install required Python packages listed in requirements.txt:
-   pip install -r requirements.txt
+   
+        pip install -r requirements.txt
    Install snscrape for X scraping:
-   sudo apt install -y snscrape
+   
+        sudo apt install -y snscrape
    Install libxml2-dev and libxslt1-dev for lxml:
-   sudo apt install -y libxml2-dev libxslt1-dev
 
-3. Set Environment Variables:
+         sudo apt install -y libxml2-dev libxslt1-dev
+
+5. Set Environment Variables:
    Create a .env file or set the following environment variables:
-   export BOT_TOKEN="your-telegram-bot-token"
-   export WEBHOOK_URL="https://your-app-url.onrender.com/webhook"
-   export PORT=8443
+   
+       export BOT_TOKEN="your-telegram-bot-token"
+       export WEBHOOK_URL="https://your-app-url.onrender.com/webhook"
+       export PORT=8443
    - Obtain BOT_TOKEN by creating a bot via https://t.me/BotFather using the /newbot command.
 
-4. Initialize Database:
+7. Initialize Database:
    The bot uses SQLite (uiu_buddy.db) to store user profiles, study plans, reminders, peer matches, and ride-share requests. The database is initialized automatically on startup.
 
-5. Run the Bot:
+8. Run the Bot:
    Start the bot and webhook server:
-   python app.py
+   
+       python app.py
    The bot will set up a webhook at WEBHOOK_URL and run on PORT.
 
 
