@@ -30,6 +30,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV BOT_TOKEN=$BOT_TOKEN
+ENV WEBHOOK_URL=https://uiu-student-bot.onrender.com/webhook
+ENV PORT=8443
 
 # Command to run the bot
 CMD ["python", "app.py"]
