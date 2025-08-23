@@ -8,5 +8,9 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: WEBHOOK_URL
+        value: https://uiu-student-bot.onrender.com/webhook
+      - key: PORT
+        value: 8443
     healthCheckPath: /
     autoDeploy: false
