@@ -2,7 +2,6 @@ import logging
 import sqlite3
 import pandas as pd
 import random
-import requests
 import os
 import json
 import time
@@ -10,8 +9,12 @@ import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from twisted.internet import reactor
+from scrapy.crawler import CrawlerRunner
+from scrapy.utils.log import configure_logging
+from scrapy import signals
+from scrapy.signalmanager import dispatcher
 import scrapy
-from scrapy.crawler import CrawlerProcess
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
@@ -22,7 +25,11 @@ from typing import List, Dict
 from requests.exceptions import HTTPError, ConnectionError, Timeout
 
 # Configure logging
-logging.config.fileConfig('logging.conf')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 logger = logging.getLogger(__name__)
 
 # Environment variables
@@ -37,22 +44,36 @@ def init_db():
         try:
             conn = sqlite3.connect('uiu_bot.db', timeout=10)
             c = conn.cursor()
-            c.execute('''CREATE TABLE IF NOT EXISTS reminders (user_id INTEGER, task TEXT, deadline TEXT, recurrence TEXT)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS code_snippets (user_id INTEGER, description TEXT, tags TEXT, snippet TEXT)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS roadmaps (roadmap_type TEXT, level TEXT, title TEXT, steps TEXT, resources TEXT, projects TEXT, last_updated REAL)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS user_profiles (user_id INTEGER PRIMARY KEY, department TEXT, year INTEGER, favorite_roadmaps TEXT)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS progress (user_id INTEGER, roadmap_type TEXT, level TEXT, completed_steps TEXT)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS faculty (name TEXT, designation TEXT, department TEXT, email TEXT, phone TEXT, expertise TEXT, last_updated REAL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS reminders (
+                user_id INTEGER, task TEXT, deadline TEXT, recurrence TEXT
+            )''')
+            c.execute('''CREATE TABLE IF NOT EXISTS code_snippets (
+                user_id INTEGER, description TEXT, tags TEXT, snippet TEXT
+            )''')
+            c.execute('''CREATE TABLE IF NOT EXISTS roadmaps (
+                roadmap_type TEXT, level TEXT, title TEXT, steps TEXT, resources TEXT, projects TEXT, last_updated REAL
+            )''')
+            c.execute('''CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id INTEGER PRIMARY KEY, department TEXT, year INTEGER, favorite_roadmaps TEXT
+            )''')
+            c.execute('''CREATE TABLE IF NOT EXISTS progress (
+                user_id INTEGER, roadmap_type TEXT, level TEXT, completed_steps TEXT
+            )''')
+            c.execute('''CREATE TABLE IF NOT EXISTS faculty (
+                name TEXT, designation TEXT, department TEXT, email TEXT, phone TEXT, expertise TEXT, last_updated REAL
+            )''')
             conn.commit()
-            conn.close()
             logger.info("Database initialized successfully")
-            return
+            return conn
         except sqlite3.OperationalError as e:
             logger.error(f"Database init attempt {attempt + 1} failed: {e}")
             if attempt < retries - 1:
                 time.sleep(1)
             else:
                 raise
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
 init_db()
 
@@ -102,7 +123,7 @@ MOCK_STACKOVERFLOW = [
     {"title": "How to debug Python code", "tags": "python, debugging", "link": "https://stackoverflow.com/questions/12345"}
 ]
 
-# Scrapy Spiders (unchanged from previous)
+# Scrapy Spiders
 class RoadmapSpider(scrapy.Spider):
     name = "roadmap"
     def __init__(self, roadmap_type="python", *args, **kwargs):
@@ -110,23 +131,27 @@ class RoadmapSpider(scrapy.Spider):
         self.start_urls = [f"https://roadmap.sh/{roadmap_type}"]
 
     def parse(self, response):
-        conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        roadmap_type = response.url.split('/')[-1]
-        levels = ['beginner', 'intermediate', 'advanced']
-        for level in levels:
-            section = response.css(f'div[data-level="{level}"]') or response.css('div.roadmap-section')
-            title = section.css('h2::text').get(default=f"{level.capitalize()} {roadmap_type.capitalize()} Roadmap")
-            steps = section.css('ul.steps li::text').getall() or ["Step not found"]
-            resources = section.css('ul.resources li a::text').getall() or ["Resource not found"]
-            projects = section.css('ul.projects li::text').getall() or ["Project not found"]
-            c.execute(
-                "INSERT OR REPLACE INTO roadmaps (roadmap_type, level, title, steps, resources, projects, last_updated) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (roadmap_type, level, title, json.dumps(steps), json.dumps(resources), json.dumps(projects), time.time())
-            )
-        conn.commit()
-        conn.close()
+        try:
+            conn = sqlite3.connect('uiu_bot.db', timeout=10)
+            c = conn.cursor()
+            roadmap_type = response.url.split('/')[-1]
+            levels = ['beginner', 'intermediate', 'advanced']
+            for level in levels:
+                section = response.css(f'div[data-level="{level}"]') or response.css('div.roadmap-section')
+                title = section.css('h2::text').get(default=f"{level.capitalize()} {roadmap_type.capitalize()} Roadmap")
+                steps = section.css('ul.steps li::text').getall() or ["Step not found"]
+                resources = section.css('ul.resources li a::text').getall() or ["Resource not found"]
+                projects = section.css('ul.projects li::text').getall() or ["Project not found"]
+                c.execute(
+                    "INSERT OR REPLACE INTO roadmaps (roadmap_type, level, title, steps, resources, projects, last_updated) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (roadmap_type, level, title, json.dumps(steps), json.dumps(resources), json.dumps(projects), time.time())
+                )
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Error parsing roadmap data: {e}")
+        finally:
+            conn.close()
 
 class FacultySpider(scrapy.Spider):
     name = "faculty"
@@ -203,7 +228,6 @@ class ResourcesSpider(scrapy.Spider):
 
     def parse(self, response):
         global temp_resources
-        temp_resources = []
         try:
             courses = response.css('div.course-item, li.course')[:5]
             for course in courses:
@@ -225,7 +249,6 @@ class TrendingSpider(scrapy.Spider):
 
     def parse(self, response):
         global temp_trending
-        temp_trending = []
         try:
             repos = response.css('article.Box-row')[:5]
             for repo in repos:
@@ -246,7 +269,6 @@ class StackOverflowSpider(scrapy.Spider):
 
     def parse(self, response):
         global temp_stackoverflow
-        temp_stackoverflow = []
         try:
             questions = response.css('div.question-summary')[:5]
             for question in questions:
@@ -268,7 +290,6 @@ class JobsSpider(scrapy.Spider):
 
     def parse(self, response):
         global temp_jobs
-        temp_jobs = []
         try:
             if "internshala" in response.url:
                 jobs = response.css('div.internship_meta')[:5]
@@ -311,7 +332,6 @@ class NoticeSpider(scrapy.Spider):
 
     def parse(self, response):
         global temp_notices
-        temp_notices = []
         try:
             notices = response.css('div.news-section article')[:3]
             for notice in notices:
@@ -355,13 +375,28 @@ class UserProfile(BaseModel):
 
 # Rate limiting
 user_last_scrape = {}
+RATE_LIMIT_SECONDS = 60
 
 def can_scrape(user_id):
     last_scrape = user_last_scrape.get(user_id, 0)
-    if time.time() - last_scrape < 60:
+    if time.time() - last_scrape < RATE_LIMIT_SECONDS:
         return False
     user_last_scrape[user_id] = time.time()
     return True
+
+# Async Scrapy runner
+async def run_spider(spider_class, **kwargs):
+    configure_logging()
+    runner = CrawlerRunner({
+        'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'CONCURRENT_REQUESTS': 16,
+        'DOWNLOAD_DELAY': 0.5,
+    })
+    deferred = runner.crawl(spider_class, **kwargs)
+    # Wait for Scrapy to finish
+    while not deferred.called:
+        await asyncio.sleep(0.1)
+    return deferred.result
 
 # Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -398,7 +433,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "   Example: /jobs internship\n"
             "8. **/roadmap <type> [level]** - Get a learning roadmap from roadmap.sh.\n"
             "   Example: /roadmap python beginner\n"
-            "9. **/mentor find <department|expertise>** - Find UIU faculty mentors from all departments (CSE, EEE, Civil Engineering, Business Administration, Economics, Pharmacy, INS, English, EDS, MSJ, BGE).\n"
+            "9. **/mentor find <department|expertise>** - Find UIU faculty mentors.\n"
             "   Example: /mentor find CSE\n"
             "10. **/notice** - View latest UIU notices.\n"
             "11. **/collab post <message>** - Post a collaboration request.\n"
@@ -437,7 +472,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(help_text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in help command: {e}")
-        await update.message.reply_text("Error displaying help. Please try again or contact support.")
+        await update.message.reply_text("Error displaying help. Please try again.")
 
 async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -446,9 +481,9 @@ async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please wait a minute before requesting another calendar.")
             return
 
-        process = CrawlerProcess({'USER_AGENT': 'Mozilla/5.0'})
-        process.crawl(CalendarSpider)
-        process.start()
+        global temp_calendar
+        temp_calendar = []
+        await run_spider(CalendarSpider)
 
         if temp_calendar:
             response = "UIU Academic Calendar Events:\n"
@@ -464,7 +499,7 @@ async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Error in calendar command: {e}")
-        await update.message.reply_text("Error fetching calendar. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching calendar. Please try again.")
 
 async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -475,15 +510,17 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please wait a minute before requesting resources.")
             return
 
-        process = CrawlerProcess({'USER_AGENT': 'Mozilla/5.0'})
-        process.crawl(ResourcesSpider)
-        process.start()
+        global temp_resources
+        temp_resources = []
+        await run_spider(ResourcesSpider)
 
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        c.execute("SELECT favorite_roadmaps FROM user_profiles WHERE user_id = ?", (user_id,))
-        profile = c.fetchone()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT favorite_roadmaps FROM user_profiles WHERE user_id = ?", (user_id,))
+            profile = c.fetchone()
+        finally:
+            conn.close()
 
         if temp_resources:
             response = "Open-Source Learning Resources:\n"
@@ -500,7 +537,7 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"Error in resources command: {e}")
-        await update.message.reply_text("Error fetching resources. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching resources. Please try again.")
 
 async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -511,9 +548,9 @@ async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please wait a minute before requesting trending repositories.")
             return
 
-        process = CrawlerProcess({'USER_AGENT': 'Mozilla/5.0'})
-        process.crawl(TrendingSpider, language=language)
-        process.start()
+        global temp_trending
+        temp_trending = []
+        await run_spider(TrendingSpider, language=language)
 
         if temp_trending:
             response = f"GitHub Trending Repositories ({language or 'All'}):\n"
@@ -526,7 +563,7 @@ async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"Error in trending command: {e}")
-        await update.message.reply_text("Error fetching trending repos. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching trending repos. Please try again.")
 
 async def stackoverflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -537,9 +574,9 @@ async def stackoverflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please wait a minute before requesting Stack Overflow questions.")
             return
 
-        process = CrawlerProcess({'USER_AGENT': 'Mozilla/5.0'})
-        process.crawl(StackOverflowSpider, tag=tag)
-        process.start()
+        global temp_stackoverflow
+        temp_stackoverflow = []
+        await run_spider(StackOverflowSpider, tag=tag)
 
         if temp_stackoverflow:
             response = f"Stack Overflow Questions ({tag or 'Recent'}):\n"
@@ -552,7 +589,7 @@ async def stackoverflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"Error in stackoverflow command: {e}")
-        await update.message.reply_text("Error fetching Stack Overflow questions. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching Stack Overflow questions. Please try again.")
 
 async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -563,15 +600,17 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please wait a minute before requesting jobs.")
             return
 
-        process = CrawlerProcess({'USER_AGENT': 'Mozilla/5.0'})
-        process.crawl(JobsSpider)
-        process.start()
+        global temp_jobs
+        temp_jobs = []
+        await run_spider(JobsSpider)
 
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        c.execute("SELECT department, favorite_roadmaps FROM user_profiles WHERE user_id = ?", (user_id,))
-        profile = c.fetchone()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT department, favorite_roadmaps FROM user_profiles WHERE user_id = ?", (user_id,))
+            profile = c.fetchone()
+        finally:
+            conn.close()
 
         if temp_jobs:
             response = "Job & Internship Opportunities:\n"
@@ -591,14 +630,14 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Error in jobs command: {e}")
-        await update.message.reply_text("Error fetching jobs. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching jobs. Please try again.")
 
 async def roadmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         user_id = update.effective_user.id
         if not args:
-            await update.message.reply_text("Please specify a roadmap, e.g., /roadmap python [beginner|intermediate|advanced]\nSee /help for details.")
+            await update.message.reply_text("Please specify a roadmap, e.g., /roadmap python [beginner|intermediate|advanced]")
             return
         roadmap_type = args[0].lower()
         level = args[1].lower() if len(args) > 1 and args[1].lower() in ['beginner', 'intermediate', 'advanced'] else None
@@ -608,29 +647,28 @@ async def roadmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        query = "SELECT title, steps, resources, projects FROM roadmaps WHERE roadmap_type = ?"
-        params = [roadmap_type]
-        if level:
-            query += " AND level = ?"
-            params.append(level)
-        c.execute(query, params)
-        roadmaps = c.fetchall()
+        try:
+            c = conn.cursor()
+            query = "SELECT title, steps, resources, projects, last_updated FROM roadmaps WHERE roadmap_type = ?"
+            params = [roadmap_type]
+            if level:
+                query += " AND level = ?"
+                params.append(level)
+            c.execute(query, params)
+            roadmaps = c.fetchall()
 
-        if not roadmaps or (c.execute("SELECT last_updated FROM roadmaps WHERE roadmap_type = ? LIMIT 1", (roadmap_type,)).fetchone() and time.time() - c.fetchone()[0] > 24*3600):
-            try:
-                process = CrawlerProcess({'USER_AGENT': 'Mozilla/5.0'})
-                process.crawl(RoadmapSpider, roadmap_type=roadmap_type)
-                process.start()
+            if not roadmaps or (roadmaps and time.time() - roadmaps[0][4] > 24*3600):
+                global temp_roadmaps
+                temp_roadmaps = []
+                await run_spider(RoadmapSpider, roadmap_type=roadmap_type)
                 c.execute(query, params)
                 roadmaps = c.fetchall()
-            except Exception as e:
-                logger.error(f"Scraping roadmap failed: {e}")
-        conn.close()
+        finally:
+            conn.close()
 
         if roadmaps:
             response = ""
-            for title, steps, resources, projects in roadmaps:
+            for title, steps, resources, projects, _ in roadmaps:
                 steps = json.loads(steps)
                 resources = json.loads(resources)
                 projects = json.loads(projects)
@@ -654,14 +692,14 @@ async def roadmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Error in roadmap command: {e}")
-        await update.message.reply_text("Error fetching roadmap. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching roadmap. Please try again.")
 
 async def mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         user_id = update.effective_user.id
         if not args or args[0].lower() != "find" or len(args) < 2:
-            await update.message.reply_text("Usage: /mentor find [department|expertise]\nExample: /mentor find CSE\nSupported departments: CSE, EEE, Civil Engineering, Business Administration, Economics, Pharmacy, INS, English, EDS, MSJ, BGE\nSee /help for details.")
+            await update.message.reply_text("Usage: /mentor find [department|expertise]\nExample: /mentor find CSE")
             return
         query = args[1].lower()
 
@@ -669,11 +707,10 @@ async def mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please wait a minute before requesting another mentor search.")
             return
 
+        global temp_faculty, temp_faculty_urls
         temp_faculty.clear()
         temp_faculty_urls.clear()
-        process = CrawlerProcess({'USER_AGENT': 'Mozilla/5.0'})
-        process.crawl(FacultySpider)
-        process.start()
+        await run_spider(FacultySpider)
 
         if temp_faculty:
             response = f"Mentors for '{query}':\n"
@@ -681,7 +718,7 @@ async def mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if filtered_faculty:
                 for f in filtered_faculty:
                     response += f"- {f['name']} ({f['designation']}, {f['department']})\n  Email: {f['email']}\n  Phone: {f['phone']}\n  Expertise: {f['expertise']}\n"
-                keyboard = [[InlineKeyboardButton(f"Contact {f['name']}", callback_data=f'contact_{f["name"].replace(" ", "_")}')] 
+                keyboard = [[InlineKeyboardButton(f"Contact {f['name']}", callback_data=f'contact_{f["name"].replace(" ", "_")}')]
                            for f in filtered_faculty[:5]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
             else:
@@ -700,7 +737,7 @@ async def mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Error in mentor command: {e}")
-        await update.message.reply_text("Error fetching mentors. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching mentors. Please try again.")
 
 async def notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -709,9 +746,9 @@ async def notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please wait a minute before requesting notices.")
             return
 
-        process = CrawlerProcess({'USER_AGENT': 'Mozilla/5.0'})
-        process.crawl(NoticeSpider)
-        process.start()
+        global temp_notices
+        temp_notices = []
+        await run_spider(NoticeSpider)
 
         if temp_notices:
             response = "Latest UIU Notices:\n"
@@ -724,19 +761,19 @@ async def notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"Error in notice command: {e}")
-        await update.message.reply_text("Error fetching notices. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching notices. Please try again.")
 
 async def collab(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         if not args or args[0].lower() != "post":
-            await update.message.reply_text("Usage: /collab post 'Your message'\nSee /help for details.")
+            await update.message.reply_text("Usage: /collab post 'Your message'")
             return
         post = " ".join(args[1:])
         await update.message.reply_text(f"Collaboration post created: {post}\nComing soon: Team matching feature.")
     except Exception as e:
         logger.error(f"Error in collab command: {e}")
-        await update.message.reply_text("Error posting collaboration request. Try again or use /help for details.")
+        await update.message.reply_text("Error posting collaboration request. Please try again.")
 
 async def events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -748,7 +785,7 @@ async def events(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Error in events command: {e}")
-        await update.message.reply_text("Error fetching events. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching events. Please try again.")
 
 async def links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -762,35 +799,35 @@ async def links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"Error in links command: {e}")
-        await update.message.reply_text("Error fetching links. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching links. Please try again.")
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("Coming soon: Developer Recognition Leaderboard.")
     except Exception as e:
         logger.error(f"Error in leaderboard command: {e}")
-        await update.message.reply_text("Error fetching leaderboard. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching leaderboard. Please try again.")
 
 async def meetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("Coming soon: UIU student-organized tech meetups and coding jams.")
     except Exception as e:
         logger.error(f"Error in meetup command: {e}")
-        await update.message.reply_text("Error fetching meetups. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching meetups. Please try again.")
 
 async def internship(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await update.message.reply_text("Use /jobs to find internships and job opportunities.\nSee /help for details.")
+        await update.message.reply_text("Use /jobs to find internships and job opportunities.")
     except Exception as e:
         logger.error(f"Error in internship command: {e}")
-        await update.message.reply_text("Error fetching internships. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching internships. Please try again.")
 
 async def cgpa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         if not args:
             await update.message.reply_text(
-                "Usage: /cgpa course1:grade1 course2:grade2\nExample: /cgpa cse321:A cse322:B+\nSee /help for details."
+                "Usage: /cgpa course1:grade1 course2:grade2\nExample: /cgpa cse321:A cse322:B+"
             )
             return
         grades = {course.split(':')[0]: course.split(':')[1] for course in args}
@@ -804,22 +841,22 @@ async def cgpa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Your CGPA: {cgpa:.2f}\n{df.to_string(index=False)}")
     except Exception as e:
         logger.error(f"Error in cgpa command: {e}")
-        await update.message.reply_text("Invalid format. Use: /cgpa cse321:A cse322:B+\nSee /help for details.")
+        await update.message.reply_text("Invalid format. Use: /cgpa cse321:A cse322:B+")
 
 async def gpapredict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         if len(args) != 2:
-            await update.message.reply_text("Usage: /gpapredict current_cgpa target_cgpa\nExample: /gpapredict 3.5 3.8\nSee /help for details.")
+            await update.message.reply_text("Usage: /gpapredict current_cgpa target_cgpa\nExample: /gpapredict 3.5 3.8")
             return
         current_cgpa, target_cgpa = float(args[0]), float(args[1])
         response = f"To achieve a target CGPA of {target_cgpa:.2f} from {current_cgpa:.2f}, aim for high grades in remaining courses. Detailed prediction coming soon."
         await update.message.reply_text(response)
     except ValueError:
-        await update.message.reply_text("Please provide valid CGPA values, e.g., /gpapredict 3.5 3.8\nSee /help for details.")
+        await update.message.reply_text("Please provide valid CGPA values, e.g., /gpapredict 3.5 3.8")
     except Exception as e:
         logger.error(f"Error in gpapredict command: {e}")
-        await update.message.reply_text("Error predicting CGPA. Try again or use /help for details.")
+        await update.message.reply_text("Error predicting CGPA. Please try again.")
 
 async def scholarships(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -829,7 +866,7 @@ async def scholarships(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"Error in scholarships command: {e}")
-        await update.message.reply_text("Error fetching scholarships. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching scholarships. Please try again.")
 
 async def academic_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await calendar(update, context)
@@ -839,13 +876,13 @@ async def career(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Coming soon: Career Office updates, CV workshops, and recruitment drives.")
     except Exception as e:
         logger.error(f"Error in career command: {e}")
-        await update.message.reply_text("Error fetching career updates. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching career updates. Please try again.")
 
 async def fyp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         if not args or args[0].lower() not in ["ideas", "docs"]:
-            await update.message.reply_text("Usage: /fyp ideas or /fyp docs\nSee /help for details.")
+            await update.message.reply_text("Usage: /fyp ideas or /fyp docs")
             return
         if args[0].lower() == "ideas":
             await update.message.reply_text("Coming soon: Trending FYP ideas from UIU alumni.")
@@ -853,13 +890,13 @@ async def fyp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Coming soon: FYP guidelines, formats, and past submissions.")
     except Exception as e:
         logger.error(f"Error in fyp command: {e}")
-        await update.message.reply_text("Error fetching FYP info. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching FYP info. Please try again.")
 
 async def studyplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
-        if len(args) < 3:
-            await update.message.reply_text("Usage: /studyplan course1,course2 hours_per_week target_date(YYYY-MM-DD) priority(course1:1,cse322:2)\nSee /help for details.")
+        if len(args) < 4:
+            await update.message.reply_text("Usage: /studyplan course1,course2 hours_per_week target_date(YYYY-MM-DD) priority(course1:1,cse322:2)")
             return
         courses, hours, target_date, priority = args[0].split(','), int(args[1]), args[2], args[3]
         plan = StudyPlan(courses=courses, hours_per_week=hours, target_date=target_date, priority=priority)
@@ -868,62 +905,66 @@ async def studyplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df['Priority'] = df['Course'].map(priorities)
         df['Hours'] = df['Priority'].apply(lambda x: (plan.hours_per_week * (3 - x)) / len(plan.courses))
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        c.execute("INSERT INTO progress (user_id, roadmap_type, level, completed_steps) VALUES (?, ?, ?, ?)",
-                  (update.effective_user.id, 'studyplan', 'current', json.dumps([])))
-        conn.commit()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute("INSERT INTO progress (user_id, roadmap_type, level, completed_steps) VALUES (?, ?, ?, ?)",
+                      (update.effective_user.id, 'studyplan', 'current', json.dumps([])))
+            conn.commit()
+        finally:
+            conn.close()
         response = f"Study Plan for {plan.target_date}:\n{df.to_string(index=False)}\nTotal Hours/Week: {plan.hours_per_week}"
         await update.message.reply_text(response)
     except ValidationError as e:
-        await update.message.reply_text(f"Invalid input: {e}\nSee /help for details.")
+        await update.message.reply_text(f"Invalid input: {e}")
     except Exception as e:
         logger.error(f"Error in studyplan command: {e}")
-        await update.message.reply_text("Error creating study plan. Try again or use /help for details.")
+        await update.message.reply_text("Error creating study plan. Please try again.")
 
 async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         if not args:
-            await update.message.reply_text("Usage: /reminders add task deadline(YYYY-MM-DD) [recurrence] or /reminders list\nSee /help for details.")
+            await update.message.reply_text("Usage: /reminders add task deadline(YYYY-MM-DD) [recurrence] or /reminders list")
             return
         user_id = update.effective_user.id
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        if args[0].lower() == "add":
-            task, deadline = " ".join(args[1:-1]), args[-1]
-            recurrence = args[-1] if len(args) > 2 and args[-2] in ['daily', 'weekly'] else 'none'
-            if recurrence != 'none':
-                deadline = args[-2]
-            try:
-                datetime.strptime(deadline, '%Y-%m-%d')
-            except ValueError:
-                await update.message.reply_text("Invalid date format. Use YYYY-MM-DD, e.g., 2025-09-01")
-                return
-            c.execute("INSERT INTO reminders (user_id, task, deadline, recurrence) VALUES (?, ?, ?, ?)", 
-                      (user_id, task, deadline, recurrence))
-            conn.commit()
-            scheduler = AsyncIOScheduler()
-            if recurrence == 'daily':
-                scheduler.add_job(send_reminder, 'interval', days=1, start_date=datetime.strptime(deadline, '%Y-%m-%d'),
-                                 args=[context.bot, user_id, task])
-            elif recurrence == 'weekly':
-                scheduler.add_job(send_reminder, 'interval', weeks=1, start_date=datetime.strptime(deadline, '%Y-%m-%d'),
-                                 args=[context.bot, user_id, task])
+        try:
+            c = conn.cursor()
+            if args[0].lower() == "add":
+                task, deadline = " ".join(args[1:-1]), args[-1]
+                recurrence = args[-1] if len(args) > 2 and args[-2] in ['daily', 'weekly'] else 'none'
+                if recurrence != 'none':
+                    deadline = args[-2]
+                try:
+                    datetime.strptime(deadline, '%Y-%m-%d')
+                except ValueError:
+                    await update.message.reply_text("Invalid date format. Use YYYY-MM-DD, e.g., 2025-09-01")
+                    return
+                c.execute("INSERT INTO reminders (user_id, task, deadline, recurrence) VALUES (?, ?, ?, ?)",
+                          (user_id, task, deadline, recurrence))
+                conn.commit()
+                scheduler = AsyncIOScheduler()
+                if recurrence == 'daily':
+                    scheduler.add_job(send_reminder, 'interval', days=1, start_date=datetime.strptime(deadline, '%Y-%m-%d'),
+                                     args=[context.bot, user_id, task])
+                elif recurrence == 'weekly':
+                    scheduler.add_job(send_reminder, 'interval', weeks=1, start_date=datetime.strptime(deadline, '%Y-%m-%d'),
+                                     args=[context.bot, user_id, task])
+                else:
+                    scheduler.add_job(send_reminder, 'date', run_date=datetime.strptime(deadline, '%Y-%m-%d'),
+                                     args=[context.bot, user_id, task])
+                scheduler.start()
+                await update.message.reply_text(f"Reminder set: {task} on {deadline} ({recurrence})")
             else:
-                scheduler.add_job(send_reminder, 'date', run_date=datetime.strptime(deadline, '%Y-%m-%d'),
-                                 args=[context.bot, user_id, task])
-            scheduler.start()
-            await update.message.reply_text(f"Reminder set: {task} on {deadline} ({recurrence})")
-        else:
-            c.execute("SELECT task, deadline, recurrence FROM reminders WHERE user_id = ?", (user_id,))
-            reminders = c.fetchall()
-            response = "Your Reminders:\n" + "\n".join(f"- {task} ({deadline}, {recurrence})" for task, deadline, recurrence in reminders)
-            await update.message.reply_text(response or "No reminders set.")
-        conn.close()
+                c.execute("SELECT task, deadline, recurrence FROM reminders WHERE user_id = ?", (user_id,))
+                reminders = c.fetchall()
+                response = "Your Reminders:\n" + "\n".join(f"- {task} ({deadline}, {recurrence})" for task, deadline, recurrence in reminders)
+                await update.message.reply_text(response or "No reminders set.")
+        finally:
+            conn.close()
     except Exception as e:
         logger.error(f"Error in reminders command: {e}")
-        await update.message.reply_text("Error setting/listing reminders. Try again or use /help for details.")
+        await update.message.reply_text("Error setting/listing reminders. Please try again.")
 
 async def send_reminder(bot, user_id, task):
     try:
@@ -934,10 +975,12 @@ async def send_reminder(bot, user_id, task):
 async def motivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        c.execute("SELECT favorite_roadmaps, department FROM user_profiles WHERE user_id = ?", (update.effective_user.id,))
-        profile = c.fetchone()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT favorite_roadmaps, department FROM user_profiles WHERE user_id = ?", (update.effective_user.id,))
+            profile = c.fetchone()
+        finally:
+            conn.close()
         tips = [
             "Keep coding! Every line you write brings you closer to mastery.",
             "Stay curious and keep learning. You've got this!",
@@ -950,62 +993,66 @@ async def motivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(random.choice(tips))
     except Exception as e:
         logger.error(f"Error in motivate command: {e}")
-        await update.message.reply_text("Error fetching motivational tip. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching motivational tip. Please try again.")
 
 async def codeshare(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         if not args:
-            await update.message.reply_text("Usage: /codeshare add 'description' 'tags' 'code' or /codeshare list [tag]\nSee /help for details.")
+            await update.message.reply_text("Usage: /codeshare add 'description' 'tags' 'code' or /codeshare list [tag]")
             return
         user_id = update.effective_user.id
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        if args[0].lower() == "add":
-            if len(args) < 3:
-                await update.message.reply_text("Usage: /codeshare add 'description' 'tags' 'code'\nSee /help for details.")
-                return
-            description, tags, code = args[1], args[2], " ".join(args[3:])
-            c.execute("INSERT INTO code_snippets (user_id, description, tags, snippet) VALUES (?, ?, ?, ?)", 
-                      (user_id, description, tags, code))
-            conn.commit()
-            await update.message.reply_text(f"Code snippet saved: {description} (Tags: {tags})")
-        else:
-            tag = args[1] if len(args) > 1 else None
-            query = "SELECT description, tags, snippet FROM code_snippets WHERE user_id = ?"
-            params = [user_id]
-            if tag:
-                query += " AND tags LIKE ?"
-                params.append(f"%{tag}%")
-            c.execute(query, params)
-            snippets = c.fetchall()
-            response = "Your Code Snippets:\n" + "\n".join(f"- {desc} (Tags: {tags}): {code}" for desc, tags, code in snippets)
-            await update.message.reply_text(response or "No snippets found.")
-        conn.close()
+        try:
+            c = conn.cursor()
+            if args[0].lower() == "add":
+                if len(args) < 3:
+                    await update.message.reply_text("Usage: /codeshare add 'description' 'tags' 'code'")
+                    return
+                description, tags, code = args[1], args[2], " ".join(args[3:])
+                c.execute("INSERT INTO code_snippets (user_id, description, tags, snippet) VALUES (?, ?, ?, ?)",
+                          (user_id, description, tags, code))
+                conn.commit()
+                await update.message.reply_text(f"Code snippet saved: {description} (Tags: {tags})")
+            else:
+                tag = args[1] if len(args) > 1 else None
+                query = "SELECT description, tags, snippet FROM code_snippets WHERE user_id = ?"
+                params = [user_id]
+                if tag:
+                    query += " AND tags LIKE ?"
+                    params.append(f"%{tag}%")
+                c.execute(query, params)
+                snippets = c.fetchall()
+                response = "Your Code Snippets:\n" + "\n".join(f"- {desc} (Tags: {tags}): {code}" for desc, tags, code in snippets)
+                await update.message.reply_text(response or "No snippets found.")
+        finally:
+            conn.close()
     except Exception as e:
         logger.error(f"Error in codeshare command: {e}")
-        await update.message.reply_text("Error handling code snippets. Try again or use /help for details.")
+        await update.message.reply_text("Error handling code snippets. Please try again.")
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         user_id = update.effective_user.id
         if not args or args[0].lower() != "set" or len(args) < 4:
-            await update.message.reply_text("Usage: /profile set department year favorite_roadmaps\nExample: /profile set CSE 2 python,javascript\nSee /help for details.")
+            await update.message.reply_text("Usage: /profile set department year favorite_roadmaps\nExample: /profile set CSE 2 python,javascript")
             return
         profile = UserProfile(department=args[1], year=int(args[2]), favorite_roadmaps=args[3])
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO user_profiles (user_id, department, year, favorite_roadmaps) VALUES (?, ?, ?, ?)",
-                  (user_id, profile.department, profile.year, profile.favorite_roadmaps))
-        conn.commit()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO user_profiles (user_id, department, year, favorite_roadmaps) VALUES (?, ?, ?, ?)",
+                      (user_id, profile.department, profile.year, profile.favorite_roadmaps))
+            conn.commit()
+        finally:
+            conn.close()
         await update.message.reply_text(f"Profile updated: {profile.department}, Year {profile.year}, Roadmaps: {profile.favorite_roadmaps}")
     except ValidationError as e:
-        await update.message.reply_text(f"Invalid input: {e}\nSee /help for details.")
+        await update.message.reply_text(f"Invalid input: {e}")
     except Exception as e:
         logger.error(f"Error in profile command: {e}")
-        await update.message.reply_text("Error setting profile. Try again or use /help for details.")
+        await update.message.reply_text("Error setting profile. Please try again.")
 
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1013,11 +1060,13 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         roadmap_type = args[0].lower() if args else 'studyplan'
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        c.execute("SELECT roadmap_type, level, completed_steps FROM progress WHERE user_id = ? AND roadmap_type = ?",
-                  (user_id, roadmap_type))
-        progress = c.fetchall()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT roadmap_type, level, completed_steps FROM progress WHERE user_id = ? AND roadmap_type = ?",
+                      (user_id, roadmap_type))
+            progress = c.fetchall()
+        finally:
+            conn.close()
         if progress:
             response = f"Progress on {roadmap_type}:\n"
             for rt, level, steps in progress:
@@ -1025,19 +1074,21 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response += f"- {level}: {len(steps)} steps completed\n"
             await update.message.reply_text(response)
         else:
-            await update.message.reply_text(f"No progress tracked for {roadmap_type}. Start with /studyplan or /roadmap.\nSee /help for details.")
+            await update.message.reply_text(f"No progress tracked for {roadmap_type}. Start with /studyplan or /roadmap.")
     except Exception as e:
         logger.error(f"Error in progress command: {e}")
-        await update.message.reply_text("Error fetching progress. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching progress. Please try again.")
 
 async def recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = update.effective_user.id
         conn = sqlite3.connect('uiu_bot.db', timeout=10)
-        c = conn.cursor()
-        c.execute("SELECT department, favorite_roadmaps FROM user_profiles WHERE user_id = ?", (user_id,))
-        profile = c.fetchone()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT department, favorite_roadmaps FROM user_profiles WHERE user_id = ?", (user_id,))
+            profile = c.fetchone()
+        finally:
+            conn.close()
         response = "Recommended Resources & Opportunities:\n"
         if profile and profile[1]:
             roadmaps, dept = profile[1], profile[0]
@@ -1054,25 +1105,22 @@ async def recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filtered_jobs = [j for j in temp_jobs if any(term in j['title'].lower() or term in j['company'].lower() for term in roadmaps.split(','))]
                 for job in filtered_jobs[:3]:
                     response += f"- Job: {job['title']} at {job['company']} ({job['location']}): {job['link']}\n"
+            global temp_faculty, temp_faculty_urls
             temp_faculty.clear()
             temp_faculty_urls.clear()
-            try:
-                process = CrawlerProcess({'USER_AGENT': 'Mozilla/5.0'})
-                process.crawl(FacultySpider)
-                process.start()
-                if temp_faculty:
-                    filtered_faculty = [f for f in temp_faculty if dept.lower() in f['department'].lower() or roadmaps.split(',')[0] in f['expertise'].lower()]
-                    if filtered_faculty:
-                        response += "Suggested Mentors:\n" + "\n".join(f"- {f['name']} ({f['email']})" for f in filtered_faculty[:3])
-            except Exception as e:
-                logger.error(f"Scraping faculty for recommend failed: {e}")
+            await run_spider(FacultySpider)
+            if temp_faculty:
+                filtered_faculty = [f for f in temp_faculty if dept.lower() in f['department'].lower() or roadmaps.split(',')[0] in f['expertise'].lower()]
+                if filtered_faculty:
+                    response += "Suggested Mentors:\n" + "\n".join(f"- {f['name']} ({f['email']})" for f in filtered_faculty[:3])
+            else:
                 response += "Suggested Mentors:\n" + "\n".join(f"- {f['name']} ({f['email']})" for f in MOCK_FACULTY if dept.lower() in f['department'].lower() or roadmaps.split(',')[0] in f['expertise'].lower())
         else:
-            response += "Set your profile with /profile to get personalized recommendations.\nSee /help for details."
+            response += "Set your profile with /profile to get personalized recommendations."
         await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"Error in recommend command: {e}")
-        await update.message.reply_text("Error fetching recommendations. Try again or use /help for details.")
+        await update.message.reply_text("Error fetching recommendations. Please try again.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1081,11 +1129,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if query.data.startswith('roadmap_'):
             _, roadmap_type, level = query.data.split('_')
             conn = sqlite3.connect('uiu_bot.db', timeout=10)
-            c = conn.cursor()
-            c.execute("SELECT title, steps, resources, projects FROM roadmaps WHERE roadmap_type = ? AND level = ?",
-                      (roadmap_type, level))
-            roadmap = c.fetchone()
-            conn.close()
+            try:
+                c = conn.cursor()
+                c.execute("SELECT title, steps, resources, projects FROM roadmaps WHERE roadmap_type = ? AND level = ?",
+                          (roadmap_type, level))
+                roadmap = c.fetchone()
+            finally:
+                conn.close()
             if roadmap:
                 title, steps, resources, projects = roadmap
                 steps = json.loads(steps)
@@ -1112,33 +1162,35 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif query.data == 'view_profile':
             user_id = query.from_user.id
             conn = sqlite3.connect('uiu_bot.db', timeout=10)
-            c = conn.cursor()
-            c.execute("SELECT department, year, favorite_roadmaps FROM user_profiles WHERE user_id = ?", (user_id,))
-            profile = c.fetchone()
-            conn.close()
+            try:
+                c = conn.cursor()
+                c.execute("SELECT department, year, favorite_roadmaps FROM user_profiles WHERE user_id = ?", (user_id,))
+                profile = c.fetchone()
+            finally:
+                conn.close()
             if profile:
                 dept, year, roadmaps = profile
                 await query.message.reply_text(f"Profile:\nDepartment: {dept}\nYear: {year}\nFavorite Roadmaps: {roadmaps}")
             else:
-                await query.message.reply_text("No profile set. Use /profile set dept year roadmaps\nSee /help for details.")
+                await query.message.reply_text("No profile set. Use /profile set dept year roadmaps")
         elif query.data == 'set_profile':
-            await query.message.reply_text("Set your profile with /profile set department year favorite_roadmaps\nExample: /profile set CSE 2 python,javascript\nSee /help for details.")
+            await query.message.reply_text("Set your profile with /profile set department year favorite_roadmaps\nExample: /profile set CSE 2 python,javascript")
         elif query.data == 'mark_attendance':
             await query.message.reply_text("Coming soon: Event attendance marking feature.")
         elif query.data == 'add_reminder_calendar':
-            await query.message.reply_text("To add a calendar event reminder, use /reminders add 'Event Name' YYYY-MM-DD [recurrence]\nSee /help for details.")
+            await query.message.reply_text("To add a calendar event reminder, use /reminders add 'Event Name' YYYY-MM-DD [recurrence]")
         elif query.data == 'add_reminder_job':
-            await query.message.reply_text("To add a job application reminder, use /reminders add 'Apply for Job Title' YYYY-MM-DD\nSee /help for details.")
+            await query.message.reply_text("To add a job application reminder, use /reminders add 'Apply for Job Title' YYYY-MM-DD")
         elif query.data == 'help':
             await help(update, context)
     except Exception as e:
         logger.error(f"Error in button callback: {e}")
-        await query.message.reply_text("Error processing your request. Try again or use /help for details.")
+        await query.message.reply_text("Error processing your request. Please try again.")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
     if update and update.message:
-        await update.message.reply_text(f"An error occurred: {str(context.error)}. Please try again or use /help for details.")
+        await update.message.reply_text("An error occurred. Please try again.")
 
 # Webhook handler
 async def webhook_handler(request: web.Request) -> web.Response:
@@ -1156,7 +1208,7 @@ async def webhook_handler(request: web.Request) -> web.Response:
 async def health_check(request: web.Request) -> web.Response:
     return web.Response(text="UIU Student Bot is running", status=200)
 
-# Setup Telegram application and webhook with retry
+# Setup Telegram application and webhook
 async def setup_application():
     global application
     retries = 3
@@ -1204,7 +1256,6 @@ async def setup_application():
             await application.initialize()
             await application.start()
 
-            # Check current webhook
             webhook_info = await application.bot.get_webhook_info()
             if webhook_info.url != WEBHOOK_URL:
                 await application.bot.delete_webhook(drop_pending_updates=True)
