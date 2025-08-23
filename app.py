@@ -7,7 +7,7 @@ import json
 import time
 import asyncio
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 import trafilatura
@@ -42,23 +42,32 @@ def init_db():
             user_id INTEGER, task TEXT, deadline TEXT
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS user_profiles (
-            user_id INTEGER PRIMARY KEY, department TEXT, year INTEGER, favorite_roadmaps TEXT, courses TEXT, commute_location TEXT
+            user_id INTEGER PRIMARY KEY, department TEXT, year INTEGER, favorite_roadmaps TEXT,
+            current_courses TEXT, section TEXT, contacts TEXT, ride_share_optin INTEGER,
+            last_updated TEXT
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS study_plans (
             user_id INTEGER, courses TEXT, hours REAL, target_date TEXT, priorities TEXT
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS peer_matches (
-            user_id INTEGER, course TEXT, location TEXT
+            user_id INTEGER, course TEXT, section TEXT, location TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS ride_shares (
+            user_id INTEGER, location_from TEXT, location_to TEXT, time_preference TEXT,
+            created_at TEXT
         )''')
         # Insert mock data for peer matching
         mock_peers = [
-            (1001, "Data Structures and Algorithms", "Mirpur"),
-            (1002, "Data Structures and Algorithms", "Dhanmondi"),
-            (1003, "Operating Systems", "Banani"),
-            (1004, "Python Programming", "Gulshan"),
-            (1005, "CSE321", "Uttara")
+            (1001, "Data Structures and Algorithms", "A", "Mirpur"),
+            (1002, "Data Structures and Algorithms", "B", "Dhanmondi"),
+            (1003, "Operating Systems", "A", "Banani"),
+            (1004, "Python Programming", "C", "Gulshan"),
+            (1005, "CSE321", "B", "Uttara")
         ]
-        c.executemany("INSERT OR IGNORE INTO peer_matches (user_id, course, location) VALUES (?, ?, ?)", mock_peers)
+        c.executemany("INSERT OR IGNORE INTO peer_matches (user_id, course, section, location) VALUES (?, ?, ?, ?)", mock_peers)
+        # Clean up profiles inactive for 5 months
+        five_months_ago = (datetime.now() - timedelta(days=150)).strftime('%Y-%m-%d')
+        c.execute("DELETE FROM user_profiles WHERE last_updated < ?", (five_months_ago,))
         conn.commit()
         logger.info("Database initialized successfully")
         return conn
@@ -100,19 +109,19 @@ async def fetch_web_content(url: str) -> str:
             logger.error(f"Error fetching {url}: {e}")
             return ""
 
-# Twitter/X scraping with snscrape
-def scrape_twitter(query: str, max_results: int = 5) -> List[Dict]:
+# X scraping with snscrape
+def scrape_x(query: str, max_results: int = 5) -> List[Dict]:
     try:
-        cmd = f"snscrape --max-results {max_results} twitter-search '{query} near:Dhaka' > twitter_results.jsonl"
+        cmd = f"snscrape --max-results {max_results} twitter-search '{query} near:Dhaka' > x_results.jsonl"
         subprocess.run(cmd, shell=True, check=True)
         results = []
-        with open("twitter_results.jsonl", "r") as f:
+        with open("x_results.jsonl", "r") as f:
             for line in f:
                 data = json.loads(line)
                 results.append({"user": data.get("user", {}).get("username", ""), "content": data.get("content", "")})
         return results
     except Exception as e:
-        logger.error(f"Twitter scrape error: {e}")
+        logger.error(f"X scrape error: {e}")
         return []
 
 # Rate limiting
@@ -126,8 +135,44 @@ def can_scrape(user_id):
     user_last_scrape[user_id] = time.time()
     return True
 
+# Update profile timestamp
+def update_profile_timestamp(user_id):
+    conn = sqlite3.connect('uiu_buddy.db', timeout=10)
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE user_profiles SET last_updated = ? WHERE user_id = ?",
+                  (datetime.now().strftime('%Y-%m-%d'), user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+# Notify ride share subscribers
+async def notify_ride_share_subscribers(app: Application, location_from: str, location_to: str, time_preference: str, requester_id: int):
+    conn = sqlite3.connect('uiu_buddy.db', timeout=10)
+    try:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM user_profiles WHERE ride_share_optin = 1 AND user_id != ?", (requester_id,))
+        subscribers = c.fetchall()
+        for sub in subscribers:
+            user_id = sub[0]
+            c.execute("SELECT location FROM peer_matches WHERE user_id = ?", (user_id,))
+            user_location = c.fetchone()
+            if user_location and fuzz.partial_ratio(location_from.lower(), user_location[0].lower()) > 70:
+                try:
+                    await app.bot.send_message(
+                        chat_id=user_id,
+                        text=f"New ride share request: From {location_from} to {location_to} at {time_preference}. Reply to coordinate!"
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending ride share notification to {user_id}: {e}")
+    finally:
+        conn.close()
+
 # Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for start command")
+        return
     try:
         keyboard = [
             [InlineKeyboardButton("View Profile", callback_data='view_profile'),
@@ -137,38 +182,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            "Welcome to UIU Buddy Bot! 🎓\n"
-            f"Find study partners, ride shares, and more.",
+            "Welcome to UIU Buddy Bot! 🎓\nFind study partners, ride shares, and more.",
             reply_markup=reply_markup
         )
+        update_profile_timestamp(update.effective_user.id)
     except Exception as e:
         logger.error(f"Error in start command: {e}")
         await update.message.reply_text("Error starting the bot. Please try again.")
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for help command")
+        return
     try:
         help_text = (
             "📚 *UIU Buddy Bot Commands*\n\n"
-            "1. **/start** - Start the bot and see welcome message.\n"
-            "2. **/help** - Show this help message with all commands.\n"
-            "3. **/about** - Learn about the UIU Developer Hub.\n"
-            "4. **/calendar** - View UIU academic calendar events.\n"
-            "5. **/resources [keyword]** - Find learning resources with Wikipedia summaries.\n"
-            "   Example: /resources python\n"
-            "6. **/cgpa <course:grade>** - Calculate CGPA.\n"
-            "   Example: /cgpa cse321:A cse322:B+\n"
-            "7. **/studyplan <courses> <hours> <date> <priority>** - Create a study plan.\n"
-            "   Example: /studyplan cse321,cse322 10 2025-12-01 cse321:1,cse322:2\n"
-            "8. **/reminders add <task> <date>** - Set reminders.\n"
-            "   Example: /reminders add Meet Dr. Suman 2025-09-01\n"
-            "9. **/reminders list** - List all reminders.\n"
-            "10. **/motivate** - Get motivational tips.\n"
-            "11. **/profile set <department> <year> <roadmaps> <courses> <commute>** - Set user profile.\n"
-            "    Example: /profile set CSE 2 python,dsa cse321,cse322 Dhanmondi\n"
-            "12. **/study find <course>** - Find peers taking a specific course.\n"
-            "    Example: /study find cse321\n"
-            "13. **/ride share <location>** - Find peers commuting to a location.\n"
-            "    Example: /ride share Dhanmondi"
+            "/start\n/help\n/about\n/calendar\n/resources\n/cgpa\n/studyplan\n/reminders\n/motivate\n/profile\n/study\n/ride\n/match"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
     except Exception as e:
@@ -176,12 +205,14 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Error displaying help. Please try again.")
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for about command")
+        return
     try:
         user_id = update.effective_user.id
         if not can_scrape(user_id):
             await update.message.reply_text("Please wait 30 seconds before requesting information again.")
             return
-
         content = await fetch_web_content("https://www.uiu.ac.bd/clubs/developer-hub")
         about_text = MOCK_ABOUT
         if content:
@@ -190,24 +221,26 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if any(kw in line.lower() for kw in ['developer hub', 'club', 'mission', 'vision']):
                     about_text = line.strip()[:500] + "..." if len(line) > 500 else line.strip()
                     break
-
         response = (
             "🏫 *About UIU Developer Hub*\n\n"
             f"{about_text}\n\n"
             "Visit https://www.facebook.com/uiudevelopershub for more details."
         )
         await update.message.reply_text(response, parse_mode='Markdown')
+        update_profile_timestamp(user_id)
     except Exception as e:
         logger.error(f"Error in about command: {e}")
         await update.message.reply_text("Error fetching UIU Developer Hub info. Please try again.")
 
 async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for calendar command")
+        return
     try:
         user_id = update.effective_user.id
         if not can_scrape(user_id):
             await update.message.reply_text("Please wait 30 seconds before requesting another calendar.")
             return
-
         global temp_calendar
         temp_calendar = []
         content = await fetch_web_content("https://www.uiu.ac.bd/academic-calendars")
@@ -216,7 +249,6 @@ async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for line in lines[:5]:
                 if any(kw in line.lower() for kw in ['event', 'seminar', 'holiday', 'exam']):
                     temp_calendar.append({"name": line.strip(), "date": "2025-09-15", "details": line.strip()})
-
         if temp_calendar:
             response = "UIU Academic Calendar Events:\n"
             for event in temp_calendar:
@@ -229,11 +261,15 @@ async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response += f"- {event['name']} ({event['date']}): {event['details']}\n"
             reply_markup = None
         await update.message.reply_text(response, reply_markup=reply_markup)
+        update_profile_timestamp(user_id)
     except Exception as e:
         logger.error(f"Error in calendar command: {e}")
         await update.message.reply_text("Error fetching calendar. Please try again.")
 
 async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for resources command")
+        return
     try:
         user_id = update.effective_user.id
         args = context.args
@@ -241,7 +277,6 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not can_scrape(user_id) and keyword:
             await update.message.reply_text("Please wait 30 seconds before requesting resources.")
             return
-
         resources = [
             {"title": "Learn Python", "platform": "freeCodeCamp", "link": "https://freecodecamp.org/learn/python"},
             {"title": "CS50", "platform": "edX", "link": "https://edx.org/course/cs50"},
@@ -249,7 +284,6 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"title": "Data Structures and Algorithms", "platform": "GeeksforGeeks", "link": "https://www.geeksforgeeks.org/data-structures"},
             {"title": "Operating Systems", "platform": "Coursera", "link": "https://www.coursera.org/learn/os"}
         ]
-
         wiki_summary = ""
         if keyword:
             page = wiki_api.page(keyword)
@@ -260,7 +294,6 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     wiki_summary = wikipedia.summary(keyword, sentences=2)
                 except:
                     wiki_summary = "No Wikipedia summary available."
-
         conn = sqlite3.connect('uiu_buddy.db', timeout=10)
         try:
             c = conn.cursor()
@@ -268,7 +301,6 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
             profile = c.fetchone()
         finally:
             conn.close()
-
         response = f"Learning Resources{f' for {keyword}' if keyword else ''}:\n"
         filtered_resources = resources
         if keyword or (profile and profile[0]):
@@ -282,11 +314,15 @@ async def resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if wiki_summary:
             response += f"\nWikipedia Summary for {keyword}:\n{wiki_summary}"
         await update.message.reply_text(response)
+        update_profile_timestamp(user_id)
     except Exception as e:
         logger.error(f"Error in resources command: {e}")
         await update.message.reply_text("Error fetching resources. Please try again.")
 
 async def cgpa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for cgpa command")
+        return
     try:
         args = context.args
         if not args:
@@ -303,11 +339,15 @@ async def cgpa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cgpa = df["Points"].mean()
         await update.message.reply_text(f"Your CGPA: {cgpa:.2f}\n{df.select(['Course', 'Grade', 'Points']).to_string()}")
+        update_profile_timestamp(update.effective_user.id)
     except Exception as e:
         logger.error(f"Error in cgpa command: {e}")
         await update.message.reply_text("Invalid format. Use: /cgpa cse321:A cse322:B+")
 
 async def studyplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for studyplan command")
+        return
     try:
         args = context.args
         if len(args) < 4:
@@ -337,11 +377,15 @@ async def studyplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
         response = f"Study Plan for {target_date}:\n{df.to_string()}\nTotal Hours/Week: {hours}"
         await update.message.reply_text(response)
+        update_profile_timestamp(update.effective_user.id)
     except Exception as e:
         logger.error(f"Error in studyplan command: {e}")
         await update.message.reply_text("Error creating study plan. Please try again.")
 
 async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for reminders command")
+        return
     try:
         args = context.args
         if not args:
@@ -369,11 +413,15 @@ async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(response or "No reminders set.")
         finally:
             conn.close()
+        update_profile_timestamp(user_id)
     except Exception as e:
         logger.error(f"Error in reminders command: {e}")
         await update.message.reply_text("Error setting/listing reminders. Please try again.")
 
 async def motivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for motivate command")
+        return
     try:
         conn = sqlite3.connect('uiu_buddy.db', timeout=10)
         try:
@@ -392,37 +440,56 @@ async def motivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if profile and profile[1]:
             tips.append(f"Your {profile[1]} journey is shaping a bright future.")
         await update.message.reply_text(random.choice(tips))
+        update_profile_timestamp(update.effective_user.id)
     except Exception as e:
         logger.error(f"Error in motivate command: {e}")
         await update.message.reply_text("Error fetching motivational tip. Please try again.")
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for profile command")
+        return
     try:
         args = context.args
         user_id = update.effective_user.id
-        if not args or args[0].lower() != "set" or len(args) < 5:
+        if not args or args[0].lower() != "set" or len(args) < 7:
             await update.message.reply_text(
-                "Usage: /profile set department year favorite_roadmaps courses commute_location\n"
-                "Example: /profile set CSE 2 python,dsa cse321,cse322 Dhanmondi"
+                "Usage: /profile set department year roadmaps courses section contacts optin_ride_share\n"
+                "Example: /profile set CSE 2 python,dsa cse321,cse322 A telegram:@user,fb:user,wa:1234567890 1"
             )
             return
-        department, year, favorite_roadmaps, courses, commute_location = args[1], int(args[2]), args[3], args[4], args[5]
+        department, year, favorite_roadmaps, current_courses, section, contacts, ride_share_optin = \
+            args[1], int(args[2]), args[3], args[4], args[5], args[6], int(args[7])
         conn = sqlite3.connect('uiu_buddy.db', timeout=10)
         try:
             c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO user_profiles (user_id, department, year, favorite_roadmaps, courses, commute_location) VALUES (?, ?, ?, ?, ?, ?)",
-                      (user_id, department, year, favorite_roadmaps, courses, commute_location))
-            c.execute("INSERT OR REPLACE INTO peer_matches (user_id, course, location) VALUES (?, ?, ?)",
-                      (user_id, courses, commute_location))
+            c.execute(
+                """INSERT OR REPLACE INTO user_profiles 
+                (user_id, department, year, favorite_roadmaps, current_courses, section, contacts, ride_share_optin, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, department, year, favorite_roadmaps, current_courses, section, contacts, ride_share_optin, datetime.now().strftime('%Y-%m-%d'))
+            )
+            for course in current_courses.split(','):
+                c.execute(
+                    "INSERT OR REPLACE INTO peer_matches (user_id, course, section, location) VALUES (?, ?, ?, ?)",
+                    (user_id, course, section, context.user_data.get('commute_location', 'Unknown'))
+                )
             conn.commit()
         finally:
             conn.close()
-        await update.message.reply_text(f"Profile updated: {department}, Year {year}, Roadmaps: {favorite_roadmaps}, Courses: {courses}, Commute: {commute_location}")
+        await update.message.reply_text(
+            f"Profile updated: {department}, Year {year}, Roadmaps: {favorite_roadmaps}, "
+            f"Courses: {current_courses}, Section: {section}, Contacts: {contacts}, Ride Share Opt-in: {ride_share_optin}"
+        )
+        context.user_data['commute_location'] = context.user_data.get('commute_location', 'Unknown')
     except Exception as e:
         logger.error(f"Error in profile command: {e}")
         await update.message.reply_text("Error setting profile. Please try again.")
 
 async def study_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for study find command")
+        return
     try:
         args = context.args
         if not args:
@@ -433,20 +500,14 @@ async def study_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not can_scrape(user_id):
             await update.message.reply_text("Please wait 30 seconds before searching for study partners.")
             return
-
-        # Fetch from database
         conn = sqlite3.connect('uiu_buddy.db', timeout=10)
         try:
             c = conn.cursor()
-            c.execute("SELECT user_id, course, location FROM peer_matches WHERE lower(course) LIKE ?", (f"%{course}%",))
+            c.execute("SELECT user_id, course, section, location, contacts FROM peer_matches p JOIN user_profiles u ON p.user_id = u.user_id WHERE lower(course) LIKE ?", (f"%{course}%",))
             matches = c.fetchall()
         finally:
             conn.close()
-
-        # Twitter/X search
-        twitter_results = scrape_twitter(f"{course} UIU", max_results=3)
-
-        # Wikipedia summary
+        x_results = scrape_x(f"{course} UIU", max_results=3)
         wiki_summary = ""
         page = wiki_api.page(course)
         if page.exists():
@@ -456,94 +517,145 @@ async def study_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 wiki_summary = wikipedia.summary(course, sentences=2)
             except:
                 wiki_summary = "No Wikipedia summary available."
-
         response = f"Study Partners for {course}:\n"
         if matches:
             for match in matches:
-                user_id, matched_course, location = match
-                response += f"- User {user_id} taking {matched_course} (Location: {location})\n"
+                user_id, matched_course, section, location, contacts = match
+                response += f"- User {user_id} (Course: {matched_course}, Section: {section}, Location: {location}, Contacts: {contacts})\n"
         else:
             response += "- No peers found in database.\n"
-
-        if twitter_results:
-            response += "\nTwitter/X Matches:\n"
-            for result in twitter_results[:3]:
+        if x_results:
+            response += "\nX Matches:\n"
+            for result in x_results[:3]:
                 response += f"- @{result['user']}: {result['content'][:100]}...\n"
         else:
-            response += "\nNo Twitter/X matches found.\n"
-
+            response += "\nNo X matches found.\n"
         if wiki_summary:
             response += f"\nWikipedia Summary for {course}:\n{wiki_summary}"
         await update.message.reply_text(response)
+        update_profile_timestamp(user_id)
     except Exception as e:
         logger.error(f"Error in study find command: {e}")
         await update.message.reply_text("Error finding study partners. Please try again.")
 
 async def ride_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for ride share command")
+        return
     try:
         args = context.args
-        if not args:
-            await update.message.reply_text("Usage: /ride share <location>\nExample: /ride share Dhanmondi")
+        if len(args) < 3:
+            await update.message.reply_text("Usage: /ride share <from> <to> <time>\nExample: /ride share Dhanmondi UIU 08:00")
             return
-        location = " ".join(args).lower()
+        location_from, location_to, time_preference = args[0].lower(), args[1].lower(), args[2]
         user_id = update.effective_user.id
         if not can_scrape(user_id):
             await update.message.reply_text("Please wait 30 seconds before searching for ride shares.")
             return
-
-        # Fetch from database
         conn = sqlite3.connect('uiu_buddy.db', timeout=10)
         try:
             c = conn.cursor()
-            c.execute("SELECT user_id, course, location FROM peer_matches WHERE lower(location) LIKE ?", (f"%{location}%",))
+            c.execute(
+                "INSERT INTO ride_shares (user_id, location_from, location_to, time_preference, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, location_from, location_to, time_preference, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            )
+            c.execute("SELECT user_id, course, section, location, contacts FROM peer_matches p JOIN user_profiles u ON p.user_id = u.user_id WHERE lower(location) LIKE ?", (f"%{location_from}%",))
             matches = c.fetchall()
+            conn.commit()
         finally:
             conn.close()
-
-        # Twitter/X search
-        twitter_results = scrape_twitter(f"commute {location} UIU", max_results=3)
-
-        response = f"Ride Share Partners for {location}:\n"
+        x_results = scrape_x(f"commute {location_from} UIU", max_results=3)
+        response = f"Ride Share Partners from {location_from} to {location_to} at {time_preference}:\n"
         if matches:
             for match in matches:
-                user_id, course, matched_location = match
-                response += f"- User {user_id} (Courses: {course}, Location: {matched_location})\n"
+                user_id, course, section, matched_location, contacts = match
+                response += f"- User {user_id} (Course: {course}, Section: {section}, Location: {matched_location}, Contacts: {contacts})\n"
         else:
             response += "- No peers found in database.\n"
-
-        if twitter_results:
-            response += "\nTwitter/X Matches:\n"
-            for result in twitter_results[:3]:
+        if x_results:
+            response += "\nX Matches:\n"
+            for result in x_results[:3]:
                 response += f"- @{result['user']}: {result['content'][:100]}...\n"
         else:
-            response += "\nNo Twitter/X matches found.\n"
+            response += "\nNo X matches found.\n"
         await update.message.reply_text(response)
+        await notify_ride_share_subscribers(context.application, location_from, location_to, time_preference, user_id)
+        update_profile_timestamp(user_id)
     except Exception as e:
         logger.error(f"Error in ride share command: {e}")
         await update.message.reply_text("Error finding ride share partners. Please try again.")
 
+async def match(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        logger.error("No message in update for match command")
+        return
+    try:
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /match <course> <section>\nExample: /match cse321 A")
+            return
+        course, section = args[0].lower(), args[1].upper()
+        user_id = update.effective_user.id
+        if not can_scrape(user_id):
+            await update.message.reply_text("Please wait 30 seconds before searching for section matches.")
+            return
+        conn = sqlite3.connect('uiu_buddy.db', timeout=10)
+        try:
+            c = conn.cursor()
+            c.execute(
+                "SELECT user_id, course, section, location, contacts FROM peer_matches p JOIN user_profiles u ON p.user_id = u.user_id WHERE lower(course) LIKE ? AND section = ?",
+                (f"%{course}%", section)
+            )
+            matches = c.fetchall()
+        finally:
+            conn.close()
+        x_results = scrape_x(f"{course} {section} UIU", max_results=3)
+        response = f"Section Matches for {course} (Section {section}):\n"
+        if matches:
+            for match in matches:
+                user_id, matched_course, matched_section, location, contacts = match
+                response += f"- User {user_id} (Course: {matched_course}, Section: {matched_section}, Location: {location}, Contacts: {contacts})\n"
+        else:
+            response += "- No peers found in database.\n"
+        if x_results:
+            response += "\nX Matches:\n"
+            for result in x_results[:3]:
+                response += f"- @{result['user']}: {result['content'][:100]}...\n"
+        else:
+            response += "\nNo X matches found.\n"
+        await update.message.reply_text(response)
+        update_profile_timestamp(user_id)
+    except Exception as e:
+        logger.error(f"Error in match command: {e}")
+        await update.message.reply_text("Error finding section matches. Please try again.")
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.callback_query:
+        logger.error("No callback query in update for button callback")
+        return
     try:
         query = update.callback_query
         await query.answer()
+        user_id = query.from_user.id
         if query.data == 'view_profile':
-            user_id = query.from_user.id
             conn = sqlite3.connect('uiu_buddy.db', timeout=10)
             try:
                 c = conn.cursor()
-                c.execute("SELECT department, year, favorite_roadmaps, courses, commute_location FROM user_profiles WHERE user_id = ?", (user_id,))
+                c.execute("SELECT department, year, favorite_roadmaps, current_courses, section, contacts, ride_share_optin FROM user_profiles WHERE user_id = ?", (user_id,))
                 profile = c.fetchone()
             finally:
                 conn.close()
             if profile:
-                dept, year, roadmaps, courses, commute = profile
-                await query.message.reply_text(f"Profile:\nDepartment: {dept}\nYear: {year}\nRoadmaps: {roadmaps}\nCourses: {courses}\nCommute: {commute}")
+                dept, year, roadmaps, courses, section, contacts, optin = profile
+                await query.message.reply_text(
+                    f"Profile:\nDepartment: {dept}\nYear: {year}\nRoadmaps: {roadmaps}\nCourses: {courses}\nSection: {section}\nContacts: {contacts}\nRide Share Opt-in: {optin}"
+                )
             else:
-                await query.message.reply_text("No profile set. Use /profile set dept year roadmaps courses commute")
+                await query.message.reply_text("No profile set. Use /profile set dept year roadmaps courses section contacts optin")
         elif query.data == 'set_profile':
             await query.message.reply_text(
-                "Set your profile with /profile set department year favorite_roadmaps courses commute_location\n"
-                "Example: /profile set CSE 2 python,dsa cse321,cse322 Dhanmondi"
+                "Set your profile with /profile set department year favorite_roadmaps courses section contacts optin_ride_share\n"
+                "Example: /profile set CSE 2 python,dsa cse321,cse322 A telegram:@user,fb:user,wa:1234567890 1"
             )
         elif query.data == 'add_reminder_calendar':
             await query.message.reply_text("To add a calendar event reminder, use /reminders add 'Event Name' YYYY-MM-DD")
@@ -551,21 +663,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await about(update, context)
         elif query.data == 'help':
             await help(update, context)
+        update_profile_timestamp(user_id)
     except Exception as e:
         logger.error(f"Error in button callback: {e}")
         await query.message.reply_text("Error processing your request. Please try again.")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
-    if update and update.message:
-        await update.message.reply_text("An error occurred. Please try again.")
+    if update:
+        if update.message:
+            await update.message.reply_text("An error occurred. Please try again.")
+        elif update.callback_query:
+            await update.callback_query.message.reply_text("An error occurred. Please try again.")
 
 # Streamlit dashboard
 def run_streamlit():
-    st.set_page_config(page_title="UIU Buddy Dashboard", page_icon="🎓")
+    st.set_page_config(page_title="UIU Buddy Dashboard", page_icon="🎓", layout="wide")
     st.title("UIU Buddy Dashboard")
-    st.header("Student Profiles, Study Plans, and Matches")
-
+    st.header("Student Profiles, Study Plans, Ride Shares, and Matches")
     conn = sqlite3.connect('uiu_buddy.db', timeout=10)
     try:
         profiles = pl.read_database("SELECT * FROM user_profiles", conn)
@@ -574,27 +689,30 @@ def run_streamlit():
             st.dataframe(profiles)
         else:
             st.write("No user profiles found.")
-
         study_plans = pl.read_database("SELECT * FROM study_plans", conn)
         if not study_plans.is_empty():
             st.subheader("Study Plans")
             st.dataframe(study_plans)
         else:
             st.write("No study plans found.")
-
         reminders = pl.read_database("SELECT * FROM reminders", conn)
         if not reminders.is_empty():
             st.subheader("Reminders")
             st.dataframe(reminders)
         else:
             st.write("No reminders set.")
-
         peer_matches = pl.read_database("SELECT * FROM peer_matches", conn)
         if not peer_matches.is_empty():
             st.subheader("Peer Matches")
             st.dataframe(peer_matches)
         else:
             st.write("No peer matches found.")
+        ride_shares = pl.read_database("SELECT * FROM ride_shares", conn)
+        if not ride_shares.is_empty():
+            st.subheader("Ride Share Requests")
+            st.dataframe(ride_shares)
+        else:
+            st.write("No ride share requests found.")
     finally:
         conn.close()
 
@@ -603,8 +721,10 @@ async def webhook_handler(request: web.Request) -> web.Response:
     try:
         data = await request.json()
         update = Update.de_json(data, application.bot)
-        if update:
-            await application.process_update(update)
+        if not update:
+            logger.error("Invalid update received in webhook")
+            return web.Response(status=400)
+        await application.process_update(update)
         return web.Response(status=200)
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -621,9 +741,7 @@ async def setup_application():
         if not BOT_TOKEN:
             logger.error("BOT_TOKEN environment variable not set")
             raise ValueError("BOT_TOKEN not set")
-
         application = Application.builder().token(BOT_TOKEN).build()
-
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help))
         application.add_handler(CommandHandler("about", about))
@@ -636,12 +754,11 @@ async def setup_application():
         application.add_handler(CommandHandler("profile", profile))
         application.add_handler(CommandHandler("study", study_find))
         application.add_handler(CommandHandler("ride", ride_share))
+        application.add_handler(CommandHandler("match", match))
         application.add_handler(CallbackQueryHandler(button_callback))
         application.add_error_handler(error_handler)
-
         await application.initialize()
         await application.start()
-
         webhook_info = await application.bot.get_webhook_info()
         if webhook_info.url != WEBHOOK_URL:
             await application.bot.delete_webhook(drop_pending_updates=True)
@@ -659,18 +776,13 @@ async def main():
         app = web.Application()
         app.router.add_post('/webhook', webhook_handler)
         app.router.add_get('/', health_check)
-
         await setup_application()
-
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', PORT)
         await site.start()
         logger.info(f"Webhook server running on port {PORT}")
-
-        import subprocess
         subprocess.Popen(["streamlit", "run", __file__, "--server.port", str(STREAMLIT_PORT)])
-
         while True:
             await asyncio.sleep(3600)
     except Exception as e:
